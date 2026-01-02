@@ -15,6 +15,8 @@
 use super::error::ErrorHelper;
 
 pub struct BulkIngestState<E: ErrorHelper> {
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
     pub table: Option<String>,
     pub mode: adbc_core::options::IngestMode,
 
@@ -37,6 +39,8 @@ where
     pub fn new() -> Self {
         Self {
             table: None,
+            catalog: None,
+            schema: None,
             mode: adbc_core::options::IngestMode::Create,
 
             _marker: std::marker::PhantomData,
@@ -66,6 +70,28 @@ where
                     Err(E::invalid_argument().format(format_args!(
                         "invalid option {}={value:?}",
                         constants::ADBC_INGEST_OPTION_TARGET_TABLE
+                    )))
+                }
+            }
+            adbc_core::options::OptionStatement::TargetCatalog => {
+                if let adbc_core::options::OptionValue::String(table) = value {
+                    self.catalog = Some(table.clone());
+                    Ok(true)
+                } else {
+                    Err(E::invalid_argument().format(format_args!(
+                        "invalid option {}={value:?}",
+                        constants::ADBC_INGEST_OPTION_TARGET_CATALOG
+                    )))
+                }
+            }
+            adbc_core::options::OptionStatement::TargetDbSchema => {
+                if let adbc_core::options::OptionValue::String(table) = value {
+                    self.schema = Some(table.clone());
+                    Ok(true)
+                } else {
+                    Err(E::invalid_argument().format(format_args!(
+                        "invalid option {}={value:?}",
+                        constants::ADBC_INGEST_OPTION_TARGET_DB_SCHEMA
                     )))
                 }
             }
