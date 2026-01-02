@@ -193,10 +193,10 @@ where
 
                     if self.rows >= self.options.batch_row_limit {
                         break;
-                    } else if let Some(limit) = self.options.batch_byte_limit {
-                        if self.bytes >= limit {
-                            break;
-                        }
+                    } else if let Some(limit) = self.options.batch_byte_limit
+                        && self.bytes >= limit
+                    {
+                        break;
                     }
                 }
                 Ok(None) => {
