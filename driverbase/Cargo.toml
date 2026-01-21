@@ -16,6 +16,7 @@
 name = "driverbase"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 adbc_core = "0.20.0"
