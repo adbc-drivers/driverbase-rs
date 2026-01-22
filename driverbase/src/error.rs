@@ -407,6 +407,9 @@ pub trait ErrorHelper: Clone + Send + Sync + Sized + 'static {
             arrow_schema::ArrowError::OffsetOverflowError(size) => {
                 Self::invalid_data().format(format_args!("offset overflowed at size {size}"))
             }
+            arrow_schema::ArrowError::AvroError(err) => {
+                Self::io().format(format_args!("Avro error: {err}"))
+            }
         }
     }
 }
