@@ -138,7 +138,7 @@ impl InfoBuilder {
             true,
         );
 
-        let union_fields = arrow_schema::UnionFields::new(
+        let union_fields = arrow_schema::UnionFields::try_new(
             vec![
                 Self::CODE_STRING,
                 Self::CODE_BOOL,
@@ -155,7 +155,8 @@ impl InfoBuilder {
                 string_list_field,
                 int32_to_int32_list_map_field,
             ],
-        );
+        )
+        .expect("failed to create union fields for InfoBuilder");
 
         let info_value = unsafe {
             arrow_array::UnionArray::new_unchecked(
