@@ -412,6 +412,13 @@ pub trait ErrorHelper: Clone + Send + Sync + Sized + 'static {
             }
         }
     }
+
+    /// Convert an iterator of errors into a single error.
+    fn from_all(errors: impl IntoIterator<Item = Error<Self>>) -> Option<Error<Self>> {
+        let mut iter = errors.into_iter();
+        let first = iter.next()?;
+        Some(iter.fold(first, |acc, err| acc.and(err)))
+    }
 }
 
 #[macro_export]

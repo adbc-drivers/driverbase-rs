@@ -82,6 +82,14 @@ impl InfoBuilder {
         self.string_value.append_value(value);
     }
 
+    fn add_info_value(&mut self, name: u32, value: &InfoValue) {
+        match value {
+            InfoValue::String(s) => {
+                self.add_string(name, s);
+            }
+        }
+    }
+
     /// Finish building and get the result as an [arrow_array::RecordBatchReader].
     pub fn build(mut self) -> Box<dyn arrow_array::RecordBatchReader + Send> {
         let info_name = self.info_name.finish();
@@ -188,5 +196,96 @@ impl InfoBuilder {
             vec![batch].into_iter().map(Ok),
             schema,
         ))
+    }
+}
+
+enum InfoValue {
+    String(String),
+}
+
+/// A registry for info values.
+#[derive(Default)]
+pub struct InfoRegistry {
+    info_values: std::collections::HashMap<adbc_core::options::InfoCode, InfoValue>,
+}
+
+impl InfoRegistry {
+    pub fn new() -> Self {
+        InfoRegistry {
+            info_values: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Add a string info value with the given key.
+    pub fn add_string(&mut self, name: adbc_core::options::InfoCode, value: impl Into<String>) {
+        self.info_values
+            .insert(name, InfoValue::String(value.into()));
+    }
+
+    /// Generate the result for a get_info, filtering by the given codes.
+    pub fn get_info(
+        &self,
+        codes: Option<std::collections::HashSet<adbc_core::options::InfoCode>>,
+    ) -> InfoBuilder {
+        let mut builder = InfoBuilder::new();
+
+        if let Some(codes) = codes {
+            for code in codes {
+                if let Some(value) = self.info_values.get(&code)
+                    && let Some(code) = info_code_to_u32(code)
+                {
+                    builder.add_info_value(code, value);
+                }
+            }
+        } else {
+            for (&name, value) in &self.info_values {
+                if let Some(code) = info_code_to_u32(name) {
+                    match value {
+                        InfoValue::String(s) => {
+                            builder.add_string(code, s);
+                        }
+                    }
+                }
+            }
+        }
+
+        builder
+    }
+}
+
+fn info_code_to_u32(code: adbc_core::options::InfoCode) -> Option<u32> {
+    match code {
+        adbc_core::options::InfoCode::VendorName => {
+            Some(adbc_core::constants::ADBC_INFO_VENDOR_NAME)
+        }
+        adbc_core::options::InfoCode::VendorVersion => {
+            Some(adbc_core::constants::ADBC_INFO_VENDOR_VERSION)
+        }
+        adbc_core::options::InfoCode::VendorArrowVersion => {
+            Some(adbc_core::constants::ADBC_INFO_VENDOR_ARROW_VERSION)
+        }
+        adbc_core::options::InfoCode::VendorSql => Some(adbc_core::constants::ADBC_INFO_VENDOR_SQL),
+        adbc_core::options::InfoCode::VendorSubstrait => {
+            Some(adbc_core::constants::ADBC_INFO_VENDOR_SUBSTRAIT)
+        }
+        adbc_core::options::InfoCode::VendorSubstraitMinVersion => {
+            Some(adbc_core::constants::ADBC_INFO_VENDOR_SUBSTRAIT_MIN_VERSION)
+        }
+        adbc_core::options::InfoCode::VendorSubstraitMaxVersion => {
+            Some(adbc_core::constants::ADBC_INFO_VENDOR_SUBSTRAIT_MAX_VERSION)
+        }
+        adbc_core::options::InfoCode::DriverName => {
+            Some(adbc_core::constants::ADBC_INFO_DRIVER_NAME)
+        }
+        adbc_core::options::InfoCode::DriverVersion => {
+            Some(adbc_core::constants::ADBC_INFO_DRIVER_VERSION)
+        }
+        adbc_core::options::InfoCode::DriverArrowVersion => {
+            Some(adbc_core::constants::ADBC_INFO_DRIVER_ARROW_VERSION)
+        }
+        adbc_core::options::InfoCode::DriverAdbcVersion => {
+            Some(adbc_core::constants::ADBC_INFO_DRIVER_ADBC_VERSION)
+        }
+        _ => None,
     }
 }
