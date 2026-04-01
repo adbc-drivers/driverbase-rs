@@ -302,8 +302,16 @@ pub trait ErrorHelper: Clone + Send + Sync + Sized + 'static {
         }
     }
 
+    fn already_exists() -> Error<Self> {
+        Self::status(adbc_core::error::Status::AlreadyExists)
+    }
+
     fn cancelled() -> Error<Self> {
         Self::status(adbc_core::error::Status::Cancelled)
+    }
+
+    fn integrity() -> Error<Self> {
+        Self::status(adbc_core::error::Status::Integrity)
     }
 
     fn internal(location: impl AsRef<str>) -> Error<Self> {
@@ -336,6 +344,18 @@ pub trait ErrorHelper: Clone + Send + Sync + Sized + 'static {
 
     fn not_implemented() -> Error<Self> {
         Self::status(adbc_core::error::Status::NotImplemented)
+    }
+
+    fn timeout() -> Error<Self> {
+        Self::status(adbc_core::error::Status::Timeout)
+    }
+
+    fn unauthenticated() -> Error<Self> {
+        Self::status(adbc_core::error::Status::Unauthenticated)
+    }
+
+    fn unauthorized() -> Error<Self> {
+        Self::status(adbc_core::error::Status::Unauthorized)
     }
 
     fn unknown() -> Error<Self> {
