@@ -152,7 +152,7 @@ pub fn get_objects<I, E>(
     table_name: Option<&str>,
     table_type: Option<Vec<&str>>,
     column_name: Option<&str>,
-) -> Box<impl arrow_array::RecordBatchReader + Send>
+) -> Box<impl arrow_array::RecordBatchReader + Send + 'static>
 where
     I: GetObjectsImpl<E>,
     E: super::error::ErrorHelper,
