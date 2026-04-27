@@ -285,6 +285,25 @@ pub trait ErrorHelper: Clone + Send + Sync + Sized + 'static {
         }
     }
 
+    /// Unwrap an option value as a string.
+    fn option_as_bool<K: std::fmt::Debug>(
+        k: &K,
+        v: &adbc_core::options::OptionValue,
+    ) -> Result<bool, super::error::Error<Self>> {
+        match v {
+            adbc_core::options::OptionValue::String(s) => {
+                if s == "true" {
+                    Ok(true)
+                } else if s == "false" {
+                    Ok(false)
+                } else {
+                    Err(Self::set_invalid_option(k, v).message("must be 'true' or 'false'"))
+                }
+            }
+            v => Err(Self::set_invalid_option(k, v).message("must be a string")),
+        }
+    }
+
     /// An error with the given status and no message.
     fn status(status: adbc_core::error::Status) -> Error<Self> {
         Error::<Self> {
