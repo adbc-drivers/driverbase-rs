@@ -20,6 +20,6 @@ license.workspace = true
 
 [dependencies]
 adbc_core = "0.23.0"
-arrow-array = "58.1"
-arrow-buffer = "58.1"
-arrow-schema = "58.1"
+arrow-array = "58.3"
+arrow-buffer = "58.3"
+arrow-schema = "58.3"
