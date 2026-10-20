@@ -26,6 +26,9 @@ pub struct TableInfo {
 #[derive(Clone, Debug)]
 pub struct ColumnInfo {
     pub column_name: String,
+    /// One-based position in the original table schema, before column filtering.
+    /// Use `None` when the position is unknown.
+    pub ordinal_position: Option<i32>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +54,8 @@ where
         table_filter: Option<&str>,
         table_type_filter: Option<&[String]>,
     ) -> Result<Vec<TableInfo>, super::error::Error<E>>;
+    /// Return matching columns with their original table ordinal positions.
+    /// Filtering must not renumber the columns in each table.
     fn get_columns(
         &self,
         catalog: &str,
@@ -359,7 +364,7 @@ where
                     .field_builder::<builder::ListBuilder<Box<dyn ArrayBuilder>>>(2)
                     .unwrap();
 
-                for (i, column) in table.columns.iter().enumerate() {
+                for column in &table.columns {
                     let column_item = table_columns
                         .values()
                         .as_any_mut()
@@ -376,7 +381,7 @@ where
                         let ordinal_position = column_item
                             .field_builder::<builder::Int32Builder>(1)
                             .unwrap();
-                        ordinal_position.append_value(i as i32 + 1);
+                        ordinal_position.append_option(column.ordinal_position);
                     }
                     {
                         let remarks = column_item
@@ -590,5 +595,169 @@ where
             }
             BuilderState::Finished => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use adbc_core::options::ObjectDepth;
+    use arrow_array::{Array, Int32Array, ListArray, StringArray, StructArray};
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestErrorHelper;
+
+    impl crate::error::ErrorHelper for TestErrorHelper {
+        const NAME: &'static str = "test";
+    }
+
+    type TestResult<T> = Result<T, crate::error::Error<TestErrorHelper>>;
+
+    struct TestCatalog;
+
+    impl GetObjectsImpl<TestErrorHelper> for TestCatalog {
+        fn get_catalogs(&self, _filter: Option<&str>) -> TestResult<Vec<String>> {
+            Ok(vec!["catalog".into()])
+        }
+
+        fn get_db_schemas(&self, _catalog: &str, _filter: Option<&str>) -> TestResult<Vec<String>> {
+            Ok(vec!["schema".into()])
+        }
+
+        fn get_tables(
+            &self,
+            _catalog: &str,
+            _db_schema: &str,
+            _table_filter: Option<&str>,
+            _table_type_filter: Option<&[String]>,
+        ) -> TestResult<Vec<TableInfo>> {
+            Ok(vec![TableInfo {
+                table_name: "table".into(),
+                table_type: "BASE TABLE".into(),
+            }])
+        }
+
+        fn get_columns(
+            &self,
+            catalog: &str,
+            db_schema: &str,
+            table_filter: Option<&str>,
+            table_type_filter: Option<&[String]>,
+            column_filter: Option<&str>,
+        ) -> TestResult<Vec<TableAndColumnInfo>> {
+            // This fixture supports exact names and the test pattern "keep_%".
+            let columns = [
+                ("first", Some(1)),
+                ("keep_second", Some(2)),
+                ("third", Some(3)),
+                ("keep_fourth", Some(4)),
+                ("unknown", None),
+            ]
+            .into_iter()
+            .filter(|(name, _)| match column_filter {
+                None => true,
+                Some("keep_%") => name.starts_with("keep_"),
+                Some(filter) => *name == filter,
+            })
+            .map(|(name, ordinal_position)| ColumnInfo {
+                column_name: name.into(),
+                ordinal_position,
+            })
+            .collect();
+            Ok(vec![TableAndColumnInfo {
+                table: self
+                    .get_tables(catalog, db_schema, table_filter, table_type_filter)?
+                    .remove(0),
+                columns,
+            }])
+        }
+    }
+
+    fn read_columns(filter: Option<&str>) -> Vec<(String, Option<i32>)> {
+        let batches = get_objects(
+            TestCatalog,
+            ObjectDepth::All,
+            None,
+            None,
+            None,
+            None,
+            filter,
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.schema().as_ref(), &get_objects_schema());
+        let schemas = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+        let tables = schemas
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+        let columns = tables
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
+        let names = columns
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let positions = columns
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        names
+            .iter()
+            .zip(positions.iter())
+            .map(|(name, position)| (name.unwrap().to_string(), position))
+            .collect()
+    }
+
+    #[test]
+    fn preserves_column_ordinals_after_filtering() {
+        assert_eq!(
+            read_columns(Some("keep_second")),
+            vec![("keep_second".into(), Some(2))]
+        );
+        assert_eq!(
+            read_columns(Some("keep_%")),
+            vec![
+                ("keep_second".into(), Some(2)),
+                ("keep_fourth".into(), Some(4)),
+            ]
+        );
+        assert!(read_columns(Some("missing")).is_empty());
+    }
+
+    #[test]
+    fn preserves_unfiltered_and_unknown_column_ordinals() {
+        assert_eq!(
+            read_columns(None),
+            vec![
+                ("first".into(), Some(1)),
+                ("keep_second".into(), Some(2)),
+                ("third".into(), Some(3)),
+                ("keep_fourth".into(), Some(4)),
+                ("unknown".into(), None),
+            ]
+        );
+        assert_eq!(
+            read_columns(Some("unknown")),
+            vec![("unknown".into(), None)]
+        );
     }
 }
