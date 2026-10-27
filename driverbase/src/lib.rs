@@ -82,11 +82,19 @@ impl InfoBuilder {
         self.string_value.append_value(value);
     }
 
+    /// Add an int64 info value with the given key.
+    pub fn add_int64(&mut self, name: u32, value: i64) {
+        self.info_name.append_value(name);
+        self.type_id.append(Self::CODE_INT64);
+        self.offset
+            .append(arrow_array::builder::ArrayBuilder::len(&self.int64_value) as i32);
+        self.int64_value.append_value(value);
+    }
+
     fn add_info_value(&mut self, name: u32, value: &InfoValue) {
         match value {
-            InfoValue::String(s) => {
-                self.add_string(name, s);
-            }
+            InfoValue::String(s) => self.add_string(name, s),
+            InfoValue::Int64(value) => self.add_int64(name, *value),
         }
     }
 
@@ -201,6 +209,7 @@ impl InfoBuilder {
 
 enum InfoValue {
     String(String),
+    Int64(i64),
 }
 
 /// A registry for info values.
@@ -222,6 +231,11 @@ impl InfoRegistry {
             .insert(name, InfoValue::String(value.into()));
     }
 
+    /// Add an int64 info value with the given key.
+    pub fn add_int64(&mut self, name: adbc_core::options::InfoCode, value: i64) {
+        self.info_values.insert(name, InfoValue::Int64(value));
+    }
+
     /// Generate the result for a get_info, filtering by the given codes.
     pub fn get_info(
         &self,
@@ -240,11 +254,7 @@ impl InfoRegistry {
         } else {
             for (&name, value) in &self.info_values {
                 if let Some(code) = info_code_to_u32(name) {
-                    match value {
-                        InfoValue::String(s) => {
-                            builder.add_string(code, s);
-                        }
-                    }
+                    builder.add_info_value(code, value);
                 }
             }
         }
@@ -287,5 +297,80 @@ fn info_code_to_u32(code: adbc_core::options::InfoCode) -> Option<u32> {
             Some(adbc_core::constants::ADBC_INFO_DRIVER_ADBC_VERSION)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod info_tests {
+    use std::collections::HashSet;
+
+    use adbc_core::constants::{ADBC_INFO_DRIVER_ADBC_VERSION, ADBC_INFO_VENDOR_NAME};
+    use adbc_core::options::InfoCode;
+    use arrow_array::{Array, Int64Array, StringArray, UInt32Array, UnionArray};
+
+    use super::InfoRegistry;
+
+    fn rows(codes: Option<HashSet<InfoCode>>) -> Vec<(u32, i8, String)> {
+        let mut registry = InfoRegistry::new();
+        registry.add_string(InfoCode::VendorName, "Columnar");
+        registry.add_int64(InfoCode::DriverAdbcVersion, 1_001_000);
+        let mut rows = Vec::new();
+        for batch in registry.get_info(codes).build() {
+            let batch = batch.unwrap();
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UnionArray>()
+                .unwrap();
+            for index in 0..batch.num_rows() {
+                let type_id = values.type_id(index);
+                let offset = values.value_offset(index);
+                let value = match type_id {
+                    0 => values
+                        .child(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(offset)
+                        .to_owned(),
+                    2 => values
+                        .child(2)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(offset)
+                        .to_string(),
+                    _ => panic!("unexpected info value type code {type_id}"),
+                };
+                rows.push((names.value(index), type_id, value));
+            }
+        }
+        rows.sort_unstable_by_key(|row| row.0);
+        rows
+    }
+
+    #[test]
+    fn int64_and_string_values_in_unfiltered_result() {
+        assert_eq!(
+            rows(None),
+            vec![
+                (ADBC_INFO_VENDOR_NAME, 0, "Columnar".into()),
+                (ADBC_INFO_DRIVER_ADBC_VERSION, 2, "1001000".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn int64_value_in_filtered_result() {
+        assert_eq!(
+            rows(Some(HashSet::from([InfoCode::DriverAdbcVersion]))),
+            vec![(ADBC_INFO_DRIVER_ADBC_VERSION, 2, "1001000".into())]
+        );
+        assert!(rows(Some(HashSet::new())).is_empty());
     }
 }
