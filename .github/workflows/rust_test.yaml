@@ -55,12 +55,12 @@ jobs:
 
       - name: build
         run: |
-          cargo build
+          cargo build --all-features
 
       - name: test
         run: |
-          cargo test
+          cargo test --all-features
 
       - name: clippy
         run: |
-          cargo clippy --no-deps -- -A unused_variables -D warnings
+          cargo clippy --all-targets --all-features --no-deps -- -A unused_variables -D warnings

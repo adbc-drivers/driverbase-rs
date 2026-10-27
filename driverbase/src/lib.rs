@@ -20,6 +20,8 @@ pub mod bulk_ingest;
 pub mod error;
 pub mod get_objects;
 pub mod record_reader;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 pub mod util;
 
 /// A helper to build the result for GetInfo.
