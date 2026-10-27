@@ -15,7 +15,7 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use arrow_array::builder::{self, ArrayBuilder};
-use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_schema::Schema;
 
 #[derive(Clone, Debug)]
 pub struct TableInfo {
@@ -23,18 +23,63 @@ pub struct TableInfo {
     pub table_type: String,
 }
 
-#[derive(Clone, Debug)]
+/// Metadata for a column returned by [`GetObjectsImpl::get_columns`].
+///
+/// Optional metadata maps to nullable Arrow fields; omit values using
+/// `..Default::default()`. Adding these fields is a breaking change for
+/// existing `ColumnInfo` struct literals: callers must add
+/// `..Default::default()` (or populate every new field).
+#[derive(Clone, Debug, Default)]
 pub struct ColumnInfo {
     pub column_name: String,
     /// One-based position in the original table schema, before column filtering.
     /// Use `None` when the position is unknown.
     pub ordinal_position: Option<i32>,
+    pub remarks: Option<String>,
+    pub xdbc_data_type: Option<i16>,
+    pub xdbc_type_name: Option<String>,
+    pub xdbc_column_size: Option<i32>,
+    pub xdbc_decimal_digits: Option<i16>,
+    pub xdbc_num_prec_radix: Option<i16>,
+    pub xdbc_nullable: Option<i16>,
+    pub xdbc_column_def: Option<String>,
+    pub xdbc_sql_data_type: Option<i16>,
+    pub xdbc_datetime_sub: Option<i16>,
+    pub xdbc_char_octet_length: Option<i32>,
+    pub xdbc_is_nullable: Option<String>,
+    pub xdbc_scope_catalog: Option<String>,
+    pub xdbc_scope_schema: Option<String>,
+    pub xdbc_scope_table: Option<String>,
+    pub xdbc_is_autoincrement: Option<bool>,
+    pub xdbc_is_generatedcolumn: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TableAndColumnInfo {
     pub table: TableInfo,
     pub columns: Vec<ColumnInfo>,
+}
+
+/// A referenced foreign-key column in a table constraint.
+#[derive(Clone, Debug)]
+pub struct ConstraintColumnUsage {
+    pub fk_catalog: Option<String>,
+    pub fk_db_schema: Option<String>,
+    pub fk_table: String,
+    pub fk_column_name: String,
+}
+
+/// Metadata for a table constraint returned by [`GetObjectsImpl::get_constraints`].
+#[derive(Clone, Debug)]
+pub struct ConstraintInfo {
+    pub constraint_name: Option<String>,
+    /// Required by the ADBC GetObjects schema (e.g. `PRIMARY KEY` or `FOREIGN KEY`).
+    pub constraint_type: String,
+    /// This list is always present and its names are never null.
+    pub constraint_column_names: Vec<String>,
+    /// Referenced columns, if applicable; `None` yields a null list,
+    /// while `Some(vec![])` yields a non-null empty list.
+    pub constraint_column_usage: Option<Vec<ConstraintColumnUsage>>,
 }
 
 pub trait GetObjectsImpl<E>: Send + 'static
@@ -64,89 +109,22 @@ where
         table_type_filter: Option<&[String]>,
         column_filter: Option<&str>,
     ) -> Result<Vec<TableAndColumnInfo>, super::error::Error<E>>;
+    /// Return constraints for a table at column/all depth.
+    /// By default, no constraints are reported, so existing implementations
+    /// need not implement this method.
+    fn get_constraints(
+        &self,
+        _catalog: &str,
+        _db_schema: &str,
+        _table: &str,
+    ) -> Result<Vec<ConstraintInfo>, super::error::Error<E>> {
+        Ok(Vec::new())
+    }
 }
 
-static SCHEMA: std::sync::LazyLock<Schema> = std::sync::LazyLock::new(|| {
-    let usage = Fields::from(vec![
-        Field::new("fk_catalog", DataType::Utf8, true),
-        Field::new("fk_db_schema", DataType::Utf8, true),
-        Field::new("fk_table", DataType::Utf8, false),
-        Field::new("fk_column_name", DataType::Utf8, false),
-    ]);
-
-    let constraint = Fields::from(vec![
-        Field::new("constraint_name", DataType::Utf8, true),
-        Field::new("constraint_type", DataType::Utf8, true),
-        Field::new_list(
-            "constraint_column_names",
-            Field::new_list_field(DataType::Utf8, false),
-            false,
-        ),
-        Field::new_list(
-            "constraint_column_usage",
-            Field::new_list_field(DataType::Struct(usage), false),
-            false,
-        ),
-    ]);
-
-    let column = Fields::from(vec![
-        Field::new("column_name", DataType::Utf8, false),
-        Field::new("ordinal_position", DataType::Int32, true),
-        Field::new("remarks", DataType::Utf8, true),
-        Field::new("xdbc_data_type", DataType::Int16, true),
-        Field::new("xdbc_type_name", DataType::Utf8, true),
-        Field::new("xdbc_column_size", DataType::Int32, true),
-        Field::new("xdbc_decimal_digits", DataType::Int16, true),
-        Field::new("xdbc_num_prec_radix", DataType::Int16, true),
-        Field::new("xdbc_nullable", DataType::Int16, true),
-        Field::new("xdbc_column_def", DataType::Utf8, true),
-        Field::new("xdbc_sql_data_type", DataType::Int16, true),
-        Field::new("xdbc_datetime_sub", DataType::Int16, true),
-        Field::new("xdbc_char_octet_length", DataType::Int32, true),
-        Field::new("xdbc_is_nullable", DataType::Utf8, true),
-        Field::new("xdbc_scope_catalog", DataType::Utf8, true),
-        Field::new("xdbc_scope_schema", DataType::Utf8, true),
-        Field::new("xdbc_scope_table", DataType::Utf8, true),
-        Field::new("xdbc_is_autoincrement", DataType::Boolean, true),
-        Field::new("xdbc_is_generatedcolumn", DataType::Boolean, true),
-    ]);
-
-    let table = Fields::from(vec![
-        Field::new("table_name", DataType::Utf8, false),
-        Field::new("table_type", DataType::Utf8, false),
-        Field::new_list(
-            "table_columns",
-            Field::new_list_field(DataType::Struct(column), false),
-            true,
-        ),
-        Field::new_list(
-            "table_constraints",
-            Field::new_list_field(DataType::Struct(constraint), false),
-            true,
-        ),
-    ]);
-
-    let db_schema = Fields::from(vec![
-        Field::new("db_schema_name", DataType::Utf8, true),
-        Field::new_list(
-            "db_schema_tables",
-            Field::new_list_field(DataType::Struct(table), false),
-            true,
-        ),
-    ]);
-
-    Schema::new(vec![
-        Field::new("catalog_name", DataType::Utf8, true),
-        Field::new_list(
-            "catalog_db_schemas",
-            Field::new_list_field(DataType::Struct(db_schema), false),
-            true,
-        ),
-    ])
-});
-
+/// Return the canonical ADBC GetObjects schema, including nested field nullability.
 pub fn get_objects_schema() -> Schema {
-    SCHEMA.clone()
+    adbc_core::schemas::GET_OBJECTS_SCHEMA.as_ref().clone()
 }
 
 pub fn get_objects<I, E>(
@@ -387,103 +365,103 @@ where
                         let remarks = column_item
                             .field_builder::<builder::StringBuilder>(2)
                             .unwrap();
-                        remarks.append_null();
+                        remarks.append_option(column.remarks.as_deref());
                     }
                     {
                         let xdbc_data_type = column_item
                             .field_builder::<builder::Int16Builder>(3)
                             .unwrap();
-                        xdbc_data_type.append_null();
+                        xdbc_data_type.append_option(column.xdbc_data_type);
                     }
                     {
                         let xdbc_type_name = column_item
                             .field_builder::<builder::StringBuilder>(4)
                             .unwrap();
-                        xdbc_type_name.append_null();
+                        xdbc_type_name.append_option(column.xdbc_type_name.as_deref());
                     }
                     {
                         let xdbc_column_size = column_item
                             .field_builder::<builder::Int32Builder>(5)
                             .unwrap();
-                        xdbc_column_size.append_null();
+                        xdbc_column_size.append_option(column.xdbc_column_size);
                     }
                     {
                         let xdbc_decimal_digits = column_item
                             .field_builder::<builder::Int16Builder>(6)
                             .unwrap();
-                        xdbc_decimal_digits.append_null();
+                        xdbc_decimal_digits.append_option(column.xdbc_decimal_digits);
                     }
                     {
                         let xdbc_num_prec_radix = column_item
                             .field_builder::<builder::Int16Builder>(7)
                             .unwrap();
-                        xdbc_num_prec_radix.append_null();
+                        xdbc_num_prec_radix.append_option(column.xdbc_num_prec_radix);
                     }
                     {
                         let xdbc_nullable = column_item
                             .field_builder::<builder::Int16Builder>(8)
                             .unwrap();
-                        xdbc_nullable.append_null();
+                        xdbc_nullable.append_option(column.xdbc_nullable);
                     }
                     {
                         let xdbc_column_def = column_item
                             .field_builder::<builder::StringBuilder>(9)
                             .unwrap();
-                        xdbc_column_def.append_null();
+                        xdbc_column_def.append_option(column.xdbc_column_def.as_deref());
                     }
                     {
                         let xdbc_sql_data_type = column_item
                             .field_builder::<builder::Int16Builder>(10)
                             .unwrap();
-                        xdbc_sql_data_type.append_null();
+                        xdbc_sql_data_type.append_option(column.xdbc_sql_data_type);
                     }
                     {
                         let xdbc_datetime_sub = column_item
                             .field_builder::<builder::Int16Builder>(11)
                             .unwrap();
-                        xdbc_datetime_sub.append_null();
+                        xdbc_datetime_sub.append_option(column.xdbc_datetime_sub);
                     }
                     {
                         let xdbc_char_octet_length = column_item
                             .field_builder::<builder::Int32Builder>(12)
                             .unwrap();
-                        xdbc_char_octet_length.append_null();
+                        xdbc_char_octet_length.append_option(column.xdbc_char_octet_length);
                     }
                     {
                         let xdbc_is_nullable = column_item
                             .field_builder::<builder::StringBuilder>(13)
                             .unwrap();
-                        xdbc_is_nullable.append_null();
+                        xdbc_is_nullable.append_option(column.xdbc_is_nullable.as_deref());
                     }
                     {
                         let xdbc_scope_catalog = column_item
                             .field_builder::<builder::StringBuilder>(14)
                             .unwrap();
-                        xdbc_scope_catalog.append_null();
+                        xdbc_scope_catalog.append_option(column.xdbc_scope_catalog.as_deref());
                     }
                     {
                         let xdbc_scope_schema = column_item
                             .field_builder::<builder::StringBuilder>(15)
                             .unwrap();
-                        xdbc_scope_schema.append_null();
+                        xdbc_scope_schema.append_option(column.xdbc_scope_schema.as_deref());
                     }
                     {
                         let xdbc_scope_table = column_item
                             .field_builder::<builder::StringBuilder>(16)
                             .unwrap();
-                        xdbc_scope_table.append_null();
+                        xdbc_scope_table.append_option(column.xdbc_scope_table.as_deref());
                     }
                     {
                         let xdbc_is_autoincrement = column_item
                             .field_builder::<builder::BooleanBuilder>(17)
                             .unwrap();
-                        xdbc_is_autoincrement.append_null();
+                        xdbc_is_autoincrement.append_option(column.xdbc_is_autoincrement);
                     }
                     {
                         let xdbc_is_generatedcolumn = column_item
                             .field_builder::<builder::BooleanBuilder>(18)
                             .unwrap();
-                        xdbc_is_generatedcolumn.append_null();
+                        xdbc_is_generatedcolumn.append_option(column.xdbc_is_generatedcolumn);
                     }
                     column_item.append(true);
                 }
@@ -491,15 +469,89 @@ where
                 table_columns.append(true);
             }
             {
+                let constraints =
+                    self.inner
+                        .get_constraints(catalog, db_schema, &table.table.table_name)?;
                 let table_constraints = table_item
                     .field_builder::<builder::ListBuilder<Box<dyn ArrayBuilder>>>(3)
                     .unwrap();
-                table_constraints.append(true);
+                Self::append_constraints(table_constraints, &constraints);
             }
             table_item.append(true);
         }
 
         Ok(())
+    }
+
+    fn append_constraints(
+        table_constraints: &mut builder::ListBuilder<Box<dyn ArrayBuilder>>,
+        constraints: &[ConstraintInfo],
+    ) {
+        for constraint in constraints {
+            let constraint_item = table_constraints
+                .values()
+                .as_any_mut()
+                .downcast_mut::<builder::StructBuilder>()
+                .unwrap();
+            constraint_item
+                .field_builder::<builder::StringBuilder>(0)
+                .unwrap()
+                .append_option(constraint.constraint_name.as_deref());
+            constraint_item
+                .field_builder::<builder::StringBuilder>(1)
+                .unwrap()
+                .append_value(&constraint.constraint_type);
+            {
+                let names = constraint_item
+                    .field_builder::<builder::ListBuilder<Box<dyn ArrayBuilder>>>(2)
+                    .unwrap();
+                let values = names
+                    .values()
+                    .as_any_mut()
+                    .downcast_mut::<builder::StringBuilder>()
+                    .unwrap();
+                for name in &constraint.constraint_column_names {
+                    values.append_value(name);
+                }
+                names.append(true);
+            }
+            {
+                let usage = constraint_item
+                    .field_builder::<builder::ListBuilder<Box<dyn ArrayBuilder>>>(3)
+                    .unwrap();
+                if let Some(columns) = &constraint.constraint_column_usage {
+                    for column in columns {
+                        let usage_item = usage
+                            .values()
+                            .as_any_mut()
+                            .downcast_mut::<builder::StructBuilder>()
+                            .unwrap();
+                        usage_item
+                            .field_builder::<builder::StringBuilder>(0)
+                            .unwrap()
+                            .append_option(column.fk_catalog.as_deref());
+                        usage_item
+                            .field_builder::<builder::StringBuilder>(1)
+                            .unwrap()
+                            .append_option(column.fk_db_schema.as_deref());
+                        usage_item
+                            .field_builder::<builder::StringBuilder>(2)
+                            .unwrap()
+                            .append_value(&column.fk_table);
+                        usage_item
+                            .field_builder::<builder::StringBuilder>(3)
+                            .unwrap()
+                            .append_value(&column.fk_column_name);
+                        usage_item.append(true);
+                    }
+                    usage.append(true);
+                } else {
+                    usage.append_null();
+                }
+            }
+            constraint_item.append(true);
+        }
+        table_constraints.append(true);
     }
 }
 
@@ -601,7 +653,9 @@ where
 #[cfg(test)]
 mod tests {
     use adbc_core::options::ObjectDepth;
-    use arrow_array::{Array, Int32Array, ListArray, StringArray, StructArray};
+    use arrow_array::{
+        Array, BooleanArray, Int16Array, Int32Array, ListArray, StringArray, StructArray,
+    };
 
     use super::*;
 
@@ -663,6 +717,7 @@ mod tests {
             .map(|(name, ordinal_position)| ColumnInfo {
                 column_name: name.into(),
                 ordinal_position,
+                ..Default::default()
             })
             .collect();
             Ok(vec![TableAndColumnInfo {
@@ -672,6 +727,147 @@ mod tests {
                 columns,
             }])
         }
+    }
+
+    struct RichCatalog {
+        constraint_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GetObjectsImpl<TestErrorHelper> for RichCatalog {
+        fn get_catalogs(&self, filter: Option<&str>) -> TestResult<Vec<String>> {
+            TestCatalog.get_catalogs(filter)
+        }
+
+        fn get_db_schemas(&self, catalog: &str, filter: Option<&str>) -> TestResult<Vec<String>> {
+            TestCatalog.get_db_schemas(catalog, filter)
+        }
+
+        fn get_tables(
+            &self,
+            catalog: &str,
+            db_schema: &str,
+            table_filter: Option<&str>,
+            table_type_filter: Option<&[String]>,
+        ) -> TestResult<Vec<TableInfo>> {
+            TestCatalog.get_tables(catalog, db_schema, table_filter, table_type_filter)
+        }
+
+        fn get_columns(
+            &self,
+            catalog: &str,
+            db_schema: &str,
+            table_filter: Option<&str>,
+            table_type_filter: Option<&[String]>,
+            _column_filter: Option<&str>,
+        ) -> TestResult<Vec<TableAndColumnInfo>> {
+            let filled = ColumnInfo {
+                column_name: "filled".into(),
+                ordinal_position: Some(1),
+                remarks: Some("a comment".into()),
+                xdbc_data_type: Some(4),
+                xdbc_type_name: Some("INTEGER".into()),
+                xdbc_column_size: Some(10),
+                xdbc_decimal_digits: Some(2),
+                xdbc_num_prec_radix: Some(10),
+                xdbc_nullable: Some(0),
+                xdbc_column_def: Some("7".into()),
+                xdbc_sql_data_type: Some(4),
+                xdbc_datetime_sub: Some(3),
+                xdbc_char_octet_length: Some(20),
+                xdbc_is_nullable: Some("NO".into()),
+                xdbc_scope_catalog: Some("scope_catalog".into()),
+                xdbc_scope_schema: Some("scope_schema".into()),
+                xdbc_scope_table: Some("scope_table".into()),
+                xdbc_is_autoincrement: Some(false),
+                xdbc_is_generatedcolumn: Some(true),
+            };
+            Ok(vec![TableAndColumnInfo {
+                table: self
+                    .get_tables(catalog, db_schema, table_filter, table_type_filter)?
+                    .remove(0),
+                columns: vec![
+                    filled,
+                    ColumnInfo {
+                        column_name: "sparse".into(),
+                        ..Default::default()
+                    },
+                ],
+            }])
+        }
+
+        fn get_constraints(
+            &self,
+            catalog: &str,
+            db_schema: &str,
+            table: &str,
+        ) -> TestResult<Vec<ConstraintInfo>> {
+            assert_eq!((catalog, db_schema, table), ("catalog", "schema", "table"));
+            self.constraint_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                ConstraintInfo {
+                    constraint_name: Some("pk_table".into()),
+                    constraint_type: "PRIMARY KEY".into(),
+                    constraint_column_names: vec!["filled".into()],
+                    constraint_column_usage: None,
+                },
+                ConstraintInfo {
+                    constraint_name: Some("fk_table".into()),
+                    constraint_type: "FOREIGN KEY".into(),
+                    constraint_column_names: vec!["filled".into(), "sparse".into()],
+                    constraint_column_usage: Some(vec![
+                        ConstraintColumnUsage {
+                            fk_catalog: Some("ref_catalog".into()),
+                            fk_db_schema: Some("ref_schema".into()),
+                            fk_table: "parent".into(),
+                            fk_column_name: "id".into(),
+                        },
+                        ConstraintColumnUsage {
+                            fk_catalog: None,
+                            fk_db_schema: None,
+                            fk_table: "parent".into(),
+                            fk_column_name: "other_id".into(),
+                        },
+                    ]),
+                },
+                ConstraintInfo {
+                    constraint_name: None,
+                    constraint_type: "CHECK".into(),
+                    constraint_column_names: Vec::new(),
+                    constraint_column_usage: Some(Vec::new()),
+                },
+            ])
+        }
+    }
+
+    fn read_tables<I: GetObjectsImpl<TestErrorHelper>>(
+        inner: I,
+        depth: ObjectDepth,
+        column_filter: Option<&str>,
+    ) -> StructArray {
+        let batches = get_objects(inner, depth, None, None, None, None, column_filter)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema().as_ref(), &get_objects_schema());
+        let schemas = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+        let tables = schemas
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        tables
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .clone()
     }
 
     fn read_columns(filter: Option<&str>) -> Vec<(String, Option<i32>)> {
@@ -759,5 +955,222 @@ mod tests {
             read_columns(Some("unknown")),
             vec![("unknown".into(), None)]
         );
+    }
+
+    #[test]
+    fn get_objects_schema_matches_canonical_adbc_schema() {
+        assert_eq!(
+            &get_objects_schema(),
+            adbc_core::schemas::GET_OBJECTS_SCHEMA.as_ref()
+        );
+    }
+
+    #[test]
+    fn emits_column_metadata_and_table_constraints_at_column_and_all_depth() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let constraint_calls = Arc::new(AtomicUsize::new(0));
+        let tables = read_tables(
+            RichCatalog {
+                constraint_calls: constraint_calls.clone(),
+            },
+            ObjectDepth::Tables,
+            None,
+        );
+        assert_eq!(constraint_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tables.len(), 1);
+        for index in [2, 3] {
+            let list = tables
+                .column(index)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            assert!(list.is_null(0));
+        }
+
+        let tables = read_tables(
+            RichCatalog {
+                constraint_calls: constraint_calls.clone(),
+            },
+            ObjectDepth::Columns,
+            None,
+        );
+        assert_eq!(constraint_calls.load(Ordering::SeqCst), 1);
+        let columns = tables
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!columns.is_null(0));
+        let columns = columns.value(0);
+        let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns.null_count(), 0);
+        let column_names = columns
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            column_names.iter().collect::<Vec<_>>(),
+            vec![Some("filled"), Some("sparse")]
+        );
+
+        macro_rules! assert_column {
+            ($index:expr, $array:ty, $value:expr) => {{
+                let field = columns
+                    .column($index)
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .unwrap();
+                assert_eq!(field.value(0), $value);
+                assert!(field.is_null(1), "column field {} should be null", $index);
+            }};
+        }
+        assert_column!(1, Int32Array, 1);
+        assert_column!(2, StringArray, "a comment");
+        assert_column!(3, Int16Array, 4);
+        assert_column!(4, StringArray, "INTEGER");
+        assert_column!(5, Int32Array, 10);
+        assert_column!(6, Int16Array, 2);
+        assert_column!(7, Int16Array, 10);
+        assert_column!(8, Int16Array, 0);
+        assert_column!(9, StringArray, "7");
+        assert_column!(10, Int16Array, 4);
+        assert_column!(11, Int16Array, 3);
+        assert_column!(12, Int32Array, 20);
+        assert_column!(13, StringArray, "NO");
+        assert_column!(14, StringArray, "scope_catalog");
+        assert_column!(15, StringArray, "scope_schema");
+        assert_column!(16, StringArray, "scope_table");
+        assert_column!(17, BooleanArray, false);
+        assert_column!(18, BooleanArray, true);
+
+        let constraints = tables
+            .column(3)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!constraints.is_null(0));
+        let constraints = constraints.value(0);
+        let constraints = constraints.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(constraints.len(), 3);
+        assert_eq!(constraints.null_count(), 0);
+        let names = constraints
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            names.iter().collect::<Vec<_>>(),
+            vec![Some("pk_table"), Some("fk_table"), None]
+        );
+        let types = constraints
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            types.iter().collect::<Vec<_>>(),
+            vec![Some("PRIMARY KEY"), Some("FOREIGN KEY"), Some("CHECK")]
+        );
+        assert_eq!(types.null_count(), 0);
+        let constraint_columns = constraints
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(constraint_columns.null_count(), 0);
+        for (index, expected) in [
+            (0, vec![Some("filled")]),
+            (1, vec![Some("filled"), Some("sparse")]),
+            (2, vec![]),
+        ] {
+            let value = constraint_columns.value(index);
+            let value = value.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(value.iter().collect::<Vec<_>>(), expected);
+            assert_eq!(value.null_count(), 0);
+        }
+
+        let usage = constraints
+            .column(3)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(usage.is_null(0));
+        assert!(!usage.is_null(1));
+        assert!(!usage.is_null(2));
+        assert_eq!(usage.value(2).len(), 0);
+        let usage_columns = usage.value(1);
+        let usage_columns = usage_columns
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(usage_columns.len(), 2);
+        assert_eq!(usage_columns.null_count(), 0);
+        for (index, expected) in [
+            (0, vec![Some("ref_catalog"), None]),
+            (1, vec![Some("ref_schema"), None]),
+            (2, vec![Some("parent"), Some("parent")]),
+            (3, vec![Some("id"), Some("other_id")]),
+        ] {
+            let value = usage_columns
+                .column(index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(value.iter().collect::<Vec<_>>(), expected);
+        }
+
+        let all_tables = read_tables(
+            RichCatalog {
+                constraint_calls: constraint_calls.clone(),
+            },
+            ObjectDepth::All,
+            None,
+        );
+        assert_eq!(constraint_calls.load(Ordering::SeqCst), 2);
+        for index in [2, 3] {
+            let list = all_tables
+                .column(index)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            assert!(!list.is_null(0));
+        }
+    }
+
+    #[test]
+    fn absent_metadata_stays_null_but_default_constraints_are_an_empty_list() {
+        let tables = read_tables(TestCatalog, ObjectDepth::All, None);
+        let columns = tables
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!columns.is_null(0));
+        let columns = columns.value(0);
+        let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
+        for index in 2..columns.num_columns() {
+            assert_eq!(columns.column(index).null_count(), columns.len());
+        }
+        let constraints = tables
+            .column(3)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!constraints.is_null(0));
+        assert_eq!(constraints.value(0).len(), 0);
+
+        let filtered_tables = read_tables(TestCatalog, ObjectDepth::Columns, Some("missing"));
+        for index in [2, 3] {
+            let list = filtered_tables
+                .column(index)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            assert!(!list.is_null(0));
+            assert_eq!(list.value(0).len(), 0);
+        }
     }
 }

@@ -32,3 +32,26 @@ ADBC operations with the dispatch and an optional validated W3C traceparent.
 The callback can record `db.response.returned_rows` or use
 `tracing_opentelemetry::OpenTelemetrySpanExt::set_attribute` for driver-specific
 attributes.
+
+## GetObjects metadata
+
+`driverbase::get_objects::ColumnInfo` accepts `remarks` and the nullable
+`xdbc_*` metadata fields; absent values remain null in the Arrow output. The
+original one-based `ordinal_position` is preserved when filtering columns.
+**Breaking change:** adding these fields means existing `ColumnInfo` struct
+literals must include `..Default::default()` (or initialize every field).
+
+Implement `GetObjectsImpl::get_constraints(catalog, db_schema, table)` to
+report `ConstraintInfo` records for each table at column/all depth. Its default
+implementation returns no constraints, so existing implementations need no
+trait changes. `constraint_column_names` is a non-null list of non-null names;
+`constraint_type` is required (for example, `PRIMARY KEY` or `FOREIGN KEY`).
+`constraint_column_usage` is `None` for a null list, or `Some(...)` for a
+non-null list of `ConstraintColumnUsage` references. At table depth, both
+`table_columns` and `table_constraints` remain null; at column/all depth,
+missing columns or constraints yield non-null empty lists.
+
+The Arrow schema is the canonical `adbc_core::schemas::GET_OBJECTS_SCHEMA`:
+this corrects the prior driverbase schema's nullable `constraint_type` and
+non-nullable nested list item declarations. Lists of returned names and
+references still contain only non-null values.
