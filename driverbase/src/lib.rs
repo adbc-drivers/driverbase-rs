@@ -82,6 +82,15 @@ impl InfoBuilder {
         self.string_value.append_value(value);
     }
 
+    /// Add a boolean info value with the given key (union type code 1).
+    pub fn add_bool(&mut self, name: u32, value: bool) {
+        self.info_name.append_value(name);
+        self.type_id.append(Self::CODE_BOOL);
+        self.offset
+            .append(arrow_array::builder::ArrayBuilder::len(&self.bool_value) as i32);
+        self.bool_value.append_value(value);
+    }
+
     /// Add an int64 info value with the given key.
     pub fn add_int64(&mut self, name: u32, value: i64) {
         self.info_name.append_value(name);
@@ -94,6 +103,7 @@ impl InfoBuilder {
     fn add_info_value(&mut self, name: u32, value: &InfoValue) {
         match value {
             InfoValue::String(s) => self.add_string(name, s),
+            InfoValue::Bool(value) => self.add_bool(name, *value),
             InfoValue::Int64(value) => self.add_int64(name, *value),
         }
     }
@@ -188,7 +198,7 @@ impl InfoBuilder {
             arrow_schema::Field::new(
                 "info_value",
                 arrow_schema::DataType::Union(union_fields, arrow_schema::UnionMode::Dense),
-                false,
+                true,
             ),
         ]));
 
@@ -209,6 +219,7 @@ impl InfoBuilder {
 
 enum InfoValue {
     String(String),
+    Bool(bool),
     Int64(i64),
 }
 
@@ -229,6 +240,11 @@ impl InfoRegistry {
     pub fn add_string(&mut self, name: adbc_core::options::InfoCode, value: impl Into<String>) {
         self.info_values
             .insert(name, InfoValue::String(value.into()));
+    }
+
+    /// Add a boolean info value with the given key.
+    pub fn add_bool(&mut self, name: adbc_core::options::InfoCode, value: bool) {
+        self.info_values.insert(name, InfoValue::Bool(value));
     }
 
     /// Add an int64 info value with the given key.
@@ -304,15 +320,21 @@ fn info_code_to_u32(code: adbc_core::options::InfoCode) -> Option<u32> {
 mod info_tests {
     use std::collections::HashSet;
 
-    use adbc_core::constants::{ADBC_INFO_DRIVER_ADBC_VERSION, ADBC_INFO_VENDOR_NAME};
+    use adbc_core::constants::{
+        ADBC_INFO_DRIVER_ADBC_VERSION, ADBC_INFO_VENDOR_NAME, ADBC_INFO_VENDOR_SQL,
+        ADBC_INFO_VENDOR_SUBSTRAIT,
+    };
     use adbc_core::options::InfoCode;
-    use arrow_array::{Array, Int64Array, StringArray, UInt32Array, UnionArray};
+    use arrow_array::{Array, BooleanArray, Int64Array, StringArray, UInt32Array, UnionArray};
+    use arrow_schema::{DataType, Field, UnionMode};
 
-    use super::InfoRegistry;
+    use super::{InfoBuilder, InfoRegistry};
 
     fn rows(codes: Option<HashSet<InfoCode>>) -> Vec<(u32, i8, String)> {
         let mut registry = InfoRegistry::new();
         registry.add_string(InfoCode::VendorName, "Columnar");
+        registry.add_bool(InfoCode::VendorSql, true);
+        registry.add_bool(InfoCode::VendorSubstrait, false);
         registry.add_int64(InfoCode::DriverAdbcVersion, 1_001_000);
         let mut rows = Vec::new();
         for batch in registry.get_info(codes).build() {
@@ -338,6 +360,13 @@ mod info_tests {
                         .unwrap()
                         .value(offset)
                         .to_owned(),
+                    1 => values
+                        .child(1)
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .unwrap()
+                        .value(offset)
+                        .to_string(),
                     2 => values
                         .child(2)
                         .as_any()
@@ -355,11 +384,13 @@ mod info_tests {
     }
 
     #[test]
-    fn int64_and_string_values_in_unfiltered_result() {
+    fn mixed_values_in_unfiltered_result() {
         assert_eq!(
             rows(None),
             vec![
                 (ADBC_INFO_VENDOR_NAME, 0, "Columnar".into()),
+                (ADBC_INFO_VENDOR_SQL, 1, "true".into()),
+                (ADBC_INFO_VENDOR_SUBSTRAIT, 1, "false".into()),
                 (ADBC_INFO_DRIVER_ADBC_VERSION, 2, "1001000".into()),
             ]
         );
@@ -372,5 +403,77 @@ mod info_tests {
             vec![(ADBC_INFO_DRIVER_ADBC_VERSION, 2, "1001000".into())]
         );
         assert!(rows(Some(HashSet::new())).is_empty());
+    }
+
+    #[test]
+    fn bool_values_in_filtered_result() {
+        assert_eq!(
+            rows(Some(HashSet::from([
+                InfoCode::VendorSql,
+                InfoCode::VendorSubstrait,
+            ]))),
+            vec![
+                (ADBC_INFO_VENDOR_SQL, 1, "true".into()),
+                (ADBC_INFO_VENDOR_SUBSTRAIT, 1, "false".into()),
+            ]
+        );
+        assert_eq!(
+            rows(Some(HashSet::from([InfoCode::VendorSubstrait]))),
+            vec![(ADBC_INFO_VENDOR_SUBSTRAIT, 1, "false".into())]
+        );
+    }
+
+    #[test]
+    fn bool_builder_preserves_dense_union_schema_and_offsets() {
+        let mut builder = InfoBuilder::new();
+        builder.add_bool(ADBC_INFO_VENDOR_SQL, true);
+        builder.add_bool(ADBC_INFO_VENDOR_SUBSTRAIT, false);
+        let mut reader = builder.build();
+        let schema = reader.schema();
+        assert_eq!(
+            schema.as_ref(),
+            adbc_core::schemas::GET_INFO_SCHEMA.as_ref()
+        );
+        assert_eq!(
+            schema.field(0),
+            &Field::new("info_name", DataType::UInt32, false)
+        );
+        let info_value = schema.field(1);
+        assert!(info_value.is_nullable());
+        assert_eq!(info_value.name(), "info_value");
+        let DataType::Union(fields, mode) = info_value.data_type() else {
+            panic!("info_value must be a union");
+        };
+        assert_eq!(mode, &UnionMode::Dense);
+        let bool_field = fields
+            .iter()
+            .find(|(type_code, _)| *type_code == 1)
+            .unwrap()
+            .1;
+        assert_eq!(
+            bool_field.as_ref(),
+            &Field::new("bool_value", DataType::Boolean, true)
+        );
+
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.schema(), schema);
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .unwrap();
+        let bool_values = values
+            .child(1)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(bool_values.len(), 2);
+        assert_eq!(values.type_id(0), 1);
+        assert_eq!(values.type_id(1), 1);
+        assert_eq!(values.value_offset(0), 0);
+        assert_eq!(values.value_offset(1), 1);
+        assert!(bool_values.value(0));
+        assert!(!bool_values.value(1));
     }
 }
