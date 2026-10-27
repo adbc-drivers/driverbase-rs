@@ -17,7 +17,7 @@ use std::{collections::VecDeque, sync::Arc};
 use arrow_array::builder::{self, ArrayBuilder};
 use arrow_schema::Schema;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableInfo {
     pub table_name: String,
     pub table_type: String,
@@ -29,7 +29,7 @@ pub struct TableInfo {
 /// `..Default::default()`. Adding these fields is a breaking change for
 /// existing `ColumnInfo` struct literals: callers must add
 /// `..Default::default()` (or populate every new field).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColumnInfo {
     pub column_name: String,
     /// One-based position in the original table schema, before column filtering.
@@ -54,14 +54,14 @@ pub struct ColumnInfo {
     pub xdbc_is_generatedcolumn: Option<bool>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableAndColumnInfo {
     pub table: TableInfo,
     pub columns: Vec<ColumnInfo>,
 }
 
 /// A referenced foreign-key column in a table constraint.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConstraintColumnUsage {
     pub fk_catalog: Option<String>,
     pub fk_db_schema: Option<String>,
@@ -70,7 +70,7 @@ pub struct ConstraintColumnUsage {
 }
 
 /// Metadata for a table constraint returned by [`GetObjectsImpl::get_constraints`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConstraintInfo {
     pub constraint_name: Option<String>,
     /// Required by the ADBC GetObjects schema (e.g. `PRIMARY KEY` or `FOREIGN KEY`).
