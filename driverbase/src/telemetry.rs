@@ -667,10 +667,8 @@ fn default_folder() -> Result<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
+        env_dir("LOCALAPPDATA", std::env::var_os("LOCALAPPDATA"))
             .map(|path| path.join("ADBC/Traces"))
-            .ok_or_else(|| telemetry_error("LOCALAPPDATA is unset", Status::InvalidState))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -685,9 +683,16 @@ fn default_folder() -> Result<PathBuf> {
 
 #[cfg(not(target_os = "windows"))]
 fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
+    env_dir("HOME", std::env::var_os("HOME"))
+}
+
+/// A base directory from environment variable `name`. An empty value counts
+/// as unset, so traces are never written relative to the working directory.
+fn env_dir(name: &str, value: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    value
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| telemetry_error("HOME is unset", Status::InvalidState))
+        .ok_or_else(|| telemetry_error(format!("{name} is unset or empty"), Status::InvalidState))
 }
 
 /// Return the ADBC status name used in the `error.type` span attribute.
@@ -973,5 +978,18 @@ mod tests {
         );
         telemetry.shutdown();
         fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn empty_base_directory_variables_are_rejected() {
+        for value in [None, Some("".into())] {
+            let error = env_dir("HOME", value).unwrap_err();
+            assert_eq!(error.status, Status::InvalidState);
+            assert!(error.message.contains("HOME is unset or empty"));
+        }
+        assert_eq!(
+            env_dir("HOME", Some("/home/u".into())).unwrap(),
+            PathBuf::from("/home/u")
+        );
     }
 }
