@@ -44,7 +44,7 @@ use serde_json::{Value as JsonValue, json};
 use tracing_opentelemetry::{OpenTelemetryLayer, OpenTelemetrySpanExt};
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::Layer;
-use tracing_subscriber::registry::Registry;
+use tracing_subscriber::registry::LookupSpan;
 
 /// ADBC connection option carrying a W3C traceparent header.
 pub const TRACE_PARENT: &str = "adbc.telemetry.trace_parent";
@@ -189,7 +189,10 @@ impl Telemetry {
     /// drops other dispatchers while holding its callsite lock when a new one
     /// is created, and dropping this layer's tracer provider emits a tracing
     /// event, so dropping one dispatcher while creating another deadlocks.
-    pub fn app_layer(&self) -> impl Layer<Registry> + Send + Sync + 'static + use<> {
+    pub fn app_layer<S>(&self) -> impl Layer<S> + Send + Sync + 'static + use<S>
+    where
+        S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync + 'static,
+    {
         OpenTelemetryLayer::new(self.tracer())
             .with_filter(Targets::new().with_target("driverbase", LevelFilter::TRACE))
     }
@@ -706,7 +709,9 @@ pub fn status_name(status: Status) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::layer::Identity;
     use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::Registry;
 
     fn temp_folder() -> PathBuf {
         std::env::temp_dir().join(format!("adbc-traces-test-{}", uuid::Uuid::new_v4()))
@@ -843,7 +848,12 @@ mod tests {
     fn traced_exports_parent_attributes_error_and_filtered_child_spans() {
         let folder = temp_folder();
         let telemetry = Telemetry::new("test", "2.3.4", "test-system");
-        let dispatch = tracing::Dispatch::new(Registry::default().with(telemetry.app_layer()));
+        // Compose with another layer to check app_layer works on any subscriber.
+        let dispatch = tracing::Dispatch::new(
+            Registry::default()
+                .with(Identity::new())
+                .with(telemetry.app_layer()),
+        );
         assert!(!telemetry.is_enabled());
         telemetry
             .traced(&dispatch, "disabled", None, |span| {
