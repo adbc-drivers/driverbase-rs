@@ -492,13 +492,18 @@ fn timestamp(time: SystemTime) -> String {
 }
 
 fn span_json(span: &SpanData, resource: &Resource) -> JsonValue {
-    let parent = opentelemetry::trace::SpanContext::new(
-        span.span_context.trace_id(),
-        span.parent_span_id,
-        span.span_context.trace_flags(),
-        span.parent_span_id != opentelemetry::trace::SpanId::INVALID,
-        span.span_context.trace_state().clone(),
-    );
+    // Root spans get an all-zero parent, as Go's stdouttrace writes.
+    let parent = if span.parent_span_id == opentelemetry::trace::SpanId::INVALID {
+        opentelemetry::trace::SpanContext::empty_context()
+    } else {
+        opentelemetry::trace::SpanContext::new(
+            span.span_context.trace_id(),
+            span.parent_span_id,
+            span.span_context.trace_flags(),
+            true,
+            span.span_context.trace_state().clone(),
+        )
+    };
     let (status_code, description) = match &span.status {
         SpanStatus::Unset => ("Unset", ""),
         SpanStatus::Ok => ("Ok", ""),
@@ -962,6 +967,10 @@ mod tests {
             .unwrap();
         assert_eq!(succeeded["Status"]["Code"], "Ok");
         assert_eq!(succeeded["Parent"]["SpanID"], "0000000000000000");
+        assert_eq!(
+            succeeded["Parent"]["TraceID"],
+            "00000000000000000000000000000000"
+        );
         telemetry.shutdown();
         fs::remove_dir_all(folder).unwrap();
     }
