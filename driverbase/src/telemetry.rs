@@ -12,21 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Driver-independent ADBC OpenTelemetry tracing. The driver owns the tracing
-//! subscriber and composes this layer with any other layers it needs.
+//! OpenTelemetry tracing for ADBC drivers, following the Go driverbase
+//! conventions.
 //!
-//! The crate versions (OpenTelemetry 0.30, tracing-opentelemetry 0.31,
-//! tracing-subscriber 0.3) are pinned to match the tracing stack of the
-//! Snowflake driver's core library, so its spans can share one subscriber and
-//! parent context; other drivers must use compatible versions to do the same.
-//!
-//! Keep the subscriber, and the [`tracing::Dispatch`] built from it, alive for
-//! the life of the process rather than per driver or database. tracing-core
-//! (0.1.36) releases other dispatchers while holding its global callsite lock
-//! when a new dispatcher is created, and dropping a subscriber that owns an
-//! OpenTelemetry tracer provider emits a tracing event, so creating one
-//! dispatcher while another is being dropped deadlocks. Call
-//! [`Telemetry::flush`] when a database is released instead.
+//! Create a [`Telemetry`], add [`Telemetry::app_layer`] to the driver's
+//! tracing subscriber, choose an exporter with [`Telemetry::configure`], and
+//! run each ADBC operation through [`Telemetry::traced`].
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -68,8 +59,13 @@ const MAX_FILES: usize = 100;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exporter {
     None,
+    /// OTLP over HTTP/protobuf, configured by the standard
+    /// `OTEL_EXPORTER_OTLP_*` environment variables.
     Otlp,
+    /// JSON lines on stdout, using the field names of Go's `stdouttrace`.
     Console,
+    /// Rotating JSON-lines files in [`TRACES_FOLDER_PATH`] or the platform's
+    /// default ADBC traces folder, in the same format as [`Exporter::Console`].
     AdbcFile,
 }
 
@@ -186,6 +182,13 @@ impl Telemetry {
     /// Only creates OTel data for spans targeting `driverbase`. A driver can
     /// append its own unfiltered layers (e.g. a core-span mirror) so they can
     /// still look up this layer's span context in the parent registry.
+    ///
+    /// Keep the subscriber and the [`tracing::Dispatch`] built from it alive
+    /// for the life of the process, and call [`Telemetry::flush`] when a
+    /// database is released rather than dropping them: tracing-core (0.1.36)
+    /// drops other dispatchers while holding its callsite lock when a new one
+    /// is created, and dropping this layer's tracer provider emits a tracing
+    /// event, so dropping one dispatcher while creating another deadlocks.
     pub fn app_layer(&self) -> impl Layer<Registry> + Send + Sync + 'static + use<> {
         OpenTelemetryLayer::new(self.tracer())
             .with_filter(Targets::new().with_target("driverbase", LevelFilter::TRACE))
@@ -263,7 +266,7 @@ impl Telemetry {
         }
     }
 
-    /// Flush and shut down the SDK provider when the driver is dropped.
+    /// Flush and shut down the SDK provider.
     pub fn shutdown(&self) {
         let _ = self.provider.force_flush();
         let _ = self.provider.shutdown();

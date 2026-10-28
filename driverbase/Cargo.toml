@@ -38,6 +38,9 @@ arrow-array = ">=58.3,<61"
 arrow-buffer = ">=58.3,<61"
 arrow-schema = ">=58.3,<61"
 chrono = { version = "0.4", optional = true }
+# tracing-opentelemetry 0.31 pairs with opentelemetry 0.30. A driver whose own
+# dependencies trace through OpenTelemetry must resolve the same versions to
+# share one subscriber and parent context with these spans.
 opentelemetry = { version = "0.30", optional = true }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"], optional = true }
 opentelemetry-semantic-conventions = { version = "0.30", optional = true }
