@@ -24,11 +24,6 @@ pub struct TableInfo {
 }
 
 /// Metadata for a column returned by [`GetObjectsImpl::get_columns`].
-///
-/// Optional metadata maps to nullable Arrow fields; omit values using
-/// `..Default::default()`. Adding these fields is a breaking change for
-/// existing `ColumnInfo` struct literals: callers must add
-/// `..Default::default()` (or populate every new field).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColumnInfo {
     pub column_name: String,
@@ -73,12 +68,10 @@ pub struct ConstraintColumnUsage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConstraintInfo {
     pub constraint_name: Option<String>,
-    /// Required by the ADBC GetObjects schema (e.g. `PRIMARY KEY` or `FOREIGN KEY`).
+    /// For example `PRIMARY KEY` or `FOREIGN KEY`.
     pub constraint_type: String,
-    /// This list is always present and its names are never null.
     pub constraint_column_names: Vec<String>,
-    /// Referenced columns, if applicable; `None` yields a null list,
-    /// while `Some(vec![])` yields a non-null empty list.
+    /// Columns referenced by a foreign key.
     pub constraint_column_usage: Option<Vec<ConstraintColumnUsage>>,
 }
 
@@ -110,8 +103,6 @@ where
         column_filter: Option<&str>,
     ) -> Result<Vec<TableAndColumnInfo>, super::error::Error<E>>;
     /// Return constraints for a table at column/all depth.
-    /// By default, no constraints are reported, so existing implementations
-    /// need not implement this method.
     fn get_constraints(
         &self,
         _catalog: &str,
@@ -122,7 +113,6 @@ where
     }
 }
 
-/// Return the canonical ADBC GetObjects schema, including nested field nullability.
 pub fn get_objects_schema() -> Schema {
     adbc_core::schemas::GET_OBJECTS_SCHEMA.as_ref().clone()
 }
