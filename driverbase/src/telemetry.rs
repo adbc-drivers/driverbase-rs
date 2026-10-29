@@ -52,21 +52,24 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::Layer;
 use tracing_subscriber::registry::LookupSpan;
 
-/// ADBC connection option carrying a W3C traceparent header.
+/// ADBC database, connection, or statement option carrying a W3C traceparent header.
 pub const TRACE_PARENT: &str = "adbc.telemetry.trace_parent";
-/// ADBC connection option selecting the trace exporter.
+/// ADBC database option selecting the trace exporter.
 pub const TRACES_EXPORTER: &str = "adbc.telemetry.traces_exporter";
-/// ADBC connection option selecting the trace file directory.
+/// ADBC database option selecting the trace file directory.
 pub const TRACES_FOLDER_PATH: &str = "adbc.telemetry.traces_folder_path";
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_FILES: usize = 100;
+// Remote parent contexts cannot be recovered from SpanData after queue overflow.
+// Evict them at this limit so dropped exports never retain contexts indefinitely.
+const MAX_PARENT_CONTEXTS: usize = 2048;
 
 /// The destination for ADBC spans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exporter {
     None,
-    /// OTLP over HTTP/protobuf, configured by the standard
-    /// `OTEL_EXPORTER_OTLP_*` environment variables.
+    /// OTLP over HTTP/protobuf. The HTTP exporter reads endpoint, headers, and
+    /// timeout environment variables; other protocols are rejected.
     Otlp,
     /// JSON lines on stdout, using the field names of Go's `stdouttrace`.
     Console,
@@ -87,6 +90,17 @@ impl Exporter {
                 format!("unknown traces exporter '{name}'"),
                 Status::InvalidArguments,
             )),
+        }
+    }
+
+    /// Parse a database exporter option; blank values are unset and allow
+    /// [`Telemetry::configure`] to fall back to `OTEL_TRACES_EXPORTER`.
+    pub fn parse_option(value: &str) -> Result<Option<Self>> {
+        let value = value.trim();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Self::parse(value).map(Some)
         }
     }
 
@@ -117,8 +131,9 @@ pub fn parent_context(value: &str) -> Context {
     TraceContextPropagator::new().extract_with_context(&Context::new(), &ParentHeader(value))
 }
 
-/// Validate a W3C traceparent, or clear the configured parent when empty.
+/// Validate a W3C traceparent, or clear the configured parent when blank.
 pub fn validate_trace_parent(value: &str) -> Result<Option<String>> {
+    let value = value.trim();
     if value.is_empty() {
         return Ok(None);
     }
@@ -138,7 +153,7 @@ pub struct Telemetry {
     provider: SdkTracerProvider,
     processor: SwitchableProcessor,
     enabled: Arc<AtomicBool>,
-    configured: Mutex<Option<(Exporter, Option<PathBuf>)>>,
+    configured: Mutex<ConfigurationState>,
     scope: InstrumentationScope,
     file_prefix: Arc<str>,
     db_system_name: Box<str>,
@@ -146,8 +161,8 @@ pub struct Telemetry {
 
 impl Telemetry {
     /// Construct an initially disabled tracer for an ADBC driver.
-    /// `driver_name` is used in the instrumentation scope and JSONL filenames;
-    /// `db_system_name` is written to operation spans as `db.system.name`.
+    /// `driver_name` is used as-is in the instrumentation scope and lowercased
+    /// in JSONL filenames; `db_system_name` is written as `db.system.name`.
     pub fn new(driver_name: &str, driver_version: &str, db_system_name: &str) -> Self {
         let enabled = Arc::new(AtomicBool::new(false));
         let processor = SwitchableProcessor::default();
@@ -166,12 +181,12 @@ impl Telemetry {
             provider,
             processor,
             enabled,
-            configured: Mutex::new(None),
+            configured: Mutex::new(ConfigurationState::Unconfigured),
             scope: InstrumentationScope::builder(format!("apache.arrow.adbc.{driver_name}"))
                 .with_version(driver_version.to_owned())
                 .with_schema_url(opentelemetry_semantic_conventions::SCHEMA_URL)
                 .build(),
-            file_prefix: Arc::from(format!("apache.arrow.adbc.{driver_name}-")),
+            file_prefix: Arc::from(format!("apache.arrow.adbc.{}-", driver_name.to_lowercase())),
             db_system_name: db_system_name.into(),
         }
     }
@@ -204,15 +219,33 @@ impl Telemetry {
             .with_filter(Targets::new().with_target("driverbase", LevelFilter::TRACE))
     }
 
-    /// Set the exporter; explicit connection options take precedence over the
+    /// Set the exporter; explicit database options take precedence over the
     /// `OTEL_TRACES_EXPORTER` environment variable. Without either, tracing is
     /// disabled. `folder` is used only for [`Exporter::AdbcFile`]. The OTLP
-    /// HTTP/protobuf exporter honors the OpenTelemetry OTLP environment vars.
+    /// HTTP/protobuf exporter reads `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS`,
+    /// `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`, and
+    /// `OTEL_EXPORTER_OTLP_TIMEOUT`. The corresponding `*_PROTOCOL` variables
+    /// must be `http/protobuf`; gRPC is not supported.
+    /// Once [`Telemetry::shutdown`] is called, configuration cannot be changed.
     pub fn configure(&self, option: Option<Exporter>, folder: Option<&str>) -> Result<()> {
+        let mut configured = self
+            .configured
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if matches!(*configured, ConfigurationState::ShutDown) {
+            return Err(telemetry_error(
+                "telemetry has been shut down",
+                Status::InvalidState,
+            ));
+        }
         let exporter = resolve_exporter(
             option,
             std::env::var("OTEL_TRACES_EXPORTER").ok().as_deref(),
         )?;
+        if exporter == Exporter::Otlp {
+            validate_otlp_protocol()?;
+        }
         let folder = (exporter == Exporter::AdbcFile)
             .then(|| {
                 folder
@@ -220,11 +253,8 @@ impl Telemetry {
                     .map(PathBuf::from)
             })
             .flatten();
-        let mut configured = self
-            .configured
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        if configured.as_ref() == Some(&(exporter, folder.clone())) {
+        if matches!(&*configured, ConfigurationState::Active(previous, previous_folder) if *previous == exporter && *previous_folder == folder)
+        {
             return Ok(());
         }
         let json_output = matches!(exporter, Exporter::Console | Exporter::AdbcFile);
@@ -294,7 +324,7 @@ impl Telemetry {
         let previous = self.processor.replace(processor, json_output);
         self.enabled
             .store(exporter != Exporter::None, Ordering::Release);
-        *configured = Some((exporter, folder));
+        *configured = ConfigurationState::Active(exporter, folder);
         if let Some(previous) = previous {
             let _ = previous.shutdown();
         }
@@ -308,8 +338,18 @@ impl Telemetry {
         }
     }
 
-    /// Flush and shut down the SDK provider.
+    /// Flush and permanently shut down the SDK provider. Subsequent calls to
+    /// [`Telemetry::configure`] return `InvalidState`.
     pub fn shutdown(&self) {
+        let mut configured = self
+            .configured
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if matches!(*configured, ConfigurationState::ShutDown) {
+            return;
+        }
+        *configured = ConfigurationState::ShutDown;
+        self.enabled.store(false, Ordering::Release);
         let _ = self.provider.force_flush();
         let _ = self.provider.shutdown();
     }
@@ -346,7 +386,7 @@ impl Telemetry {
                 Ok(_) => span.set_status(SpanStatus::Ok),
                 Err(error) => {
                     span.record("error.type", status_name(error.status));
-                    tracing::error!(parent: &span, error = %error, "ADBC operation failed");
+                    tracing::error!(parent: &span, error = %error, exception.type = std::any::type_name_of_val(error));
                     span.set_status(SpanStatus::error(error.message.clone()));
                 }
             }
@@ -356,12 +396,32 @@ impl Telemetry {
 }
 
 fn resolve_exporter(option: Option<Exporter>, environment: Option<&str>) -> Result<Exporter> {
-    match option {
-        Some(exporter) => Ok(exporter),
-        None => environment
-            .filter(|value| !value.is_empty())
-            .map_or(Ok(Exporter::None), Exporter::parse),
+    option.map_or_else(
+        || {
+            environment
+                .map(Exporter::parse_option)
+                .transpose()
+                .map(|parsed| parsed.flatten().unwrap_or(Exporter::None))
+        },
+        Ok,
+    )
+}
+
+fn validate_otlp_protocol() -> Result<()> {
+    for name in [
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+    ] {
+        if let Some(value) = std::env::var_os(name)
+            && value.to_str() != Some("http/protobuf")
+        {
+            return Err(telemetry_error(
+                format!("{name}={value:?}: only http/protobuf is supported (gRPC is unsupported)"),
+                Status::InvalidArguments,
+            ));
+        }
     }
+    Ok(())
 }
 
 fn telemetry_error(error: impl std::fmt::Display, status: Status) -> Error {
@@ -406,6 +466,12 @@ impl ShouldSample for SwitchableSampler {
     }
 }
 
+enum ConfigurationState {
+    Unconfigured,
+    Active(Exporter, Option<PathBuf>),
+    ShutDown,
+}
+
 type ParentContexts = Arc<Mutex<HashMap<SpanId, SpanContext>>>;
 
 #[derive(Default, Debug)]
@@ -439,11 +505,19 @@ impl SwitchableProcessor {
 impl SpanProcessor for SwitchableProcessor {
     fn on_start(&self, span: &mut SdkSpan, context: &Context) {
         let parent = context.span();
-        if span.is_recording() && parent.span_context().is_valid() {
-            self.parents
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .insert(span.span_context().span_id(), parent.span_context().clone());
+        if span.is_recording()
+            && parent.span_context().is_valid()
+            && parent.span_context().is_remote()
+        {
+            let mut parents = self.parents.lock().unwrap_or_else(|err| err.into_inner());
+            if parents.len() >= MAX_PARENT_CONTEXTS {
+                // A full batch queue can drop spans without calling the exporter.
+                // Evict one remote parent rather than retain it for the process lifetime.
+                if let Some(span_id) = parents.keys().next().copied() {
+                    parents.remove(&span_id);
+                }
+            }
+            parents.insert(span.span_context().span_id(), parent.span_context().clone());
         }
     }
 
@@ -523,20 +597,22 @@ impl JsonExporter {
     }
 
     fn write_spans(&self, spans: &[SpanData]) -> io::Result<()> {
+        // Every span in a failed batch must release its saved remote parent.
+        let values: Vec<_> = spans.iter().map(|span| self.span_json(span)).collect();
         match &self.output {
             JsonOutput::Stdout => {
                 let stdout = io::stdout();
                 let mut writer = stdout.lock();
-                for span in spans {
-                    serde_json::to_writer(&mut writer, &self.span_json(span))?;
+                for value in &values {
+                    serde_json::to_writer(&mut writer, value)?;
                     writer.write_all(b"\n")?;
                 }
                 writer.flush()
             }
             JsonOutput::File(writer) => {
                 let mut writer = writer.lock().unwrap_or_else(|err| err.into_inner());
-                for span in spans {
-                    let mut line = serde_json::to_vec(&self.span_json(span))?;
+                for value in &values {
+                    let mut line = serde_json::to_vec(value)?;
                     line.push(b'\n');
                     writer.write_line(&line)?;
                 }
@@ -702,28 +778,56 @@ impl RotatingFileWriter {
         if self.file.is_none() || self.bytes > 0 && self.bytes + line.len() as u64 > self.max_bytes
         {
             self.file.take();
-            self.open_file()?;
+            self.open_file(line.len())?;
         }
-        self.file
+        if let Err(error) = self
+            .file
             .as_mut()
             .expect("file just opened")
-            .write_all(line)?;
+            .write_all(line)
+        {
+            self.discard_partial_line();
+            return Err(error);
+        }
         self.bytes += line.len() as u64;
         Ok(())
     }
 
-    fn open_file(&mut self) -> io::Result<()> {
+    fn discard_partial_line(&mut self) {
+        if let Some(file) = self.file.take() {
+            // Roll back an incomplete JSONL record to the last committed offset.
+            let _ = file.set_len(self.bytes);
+        }
+    }
+
+    fn open_file(&mut self, line_len: usize) -> io::Result<()> {
+        // Like the Go writer, reuse the latest non-full file for this driver.
+        // Avoid appending a line that would exceed the strict file-size cap.
+        if let Some(path) = self.trace_files()?.pop()
+            && let Ok(file) = OpenOptions::new().append(true).open(&path)
+            && let Ok(metadata) = file.metadata()
+        {
+            let bytes = metadata.len();
+            if bytes < self.max_bytes
+                && (bytes == 0 || bytes.saturating_add(line_len as u64) <= self.max_bytes)
+            {
+                self.file = Some(file);
+                self.bytes = bytes;
+                return Ok(());
+            }
+        }
         let mut timestamp = SystemTime::now();
         loop {
             let formatted = DateTime::<Utc>::from(timestamp).format("%Y-%m-%d-%H-%M-%S.%f");
             let path = self
                 .folder
                 .join(format!("{}{formatted}.jsonl", self.prefix));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            match OpenOptions::new().append(true).create_new(true).open(&path) {
                 Ok(file) => {
                     self.file = Some(file);
                     self.bytes = 0;
-                    self.prune(&path)?;
+                    // Pruning is maintenance, not a reason to lose an export.
+                    let _ = self.prune(&path);
                     return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -734,7 +838,7 @@ impl RotatingFileWriter {
         }
     }
 
-    fn prune(&self, current: &Path) -> io::Result<()> {
+    fn trace_files(&self) -> io::Result<Vec<PathBuf>> {
         let mut files = fs::read_dir(&self.folder)?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
@@ -749,9 +853,19 @@ impl RotatingFileWriter {
             })
             .collect::<Vec<_>>();
         files.sort_unstable();
+        Ok(files)
+    }
+
+    fn prune(&self, current: &Path) -> io::Result<()> {
+        let mut files = self.trace_files()?;
         while files.len() > self.max_files {
             let index = files.iter().position(|path| path != current).unwrap_or(0);
-            fs::remove_file(files.remove(index))?;
+            match fs::remove_file(&files[index]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            files.remove(index);
         }
         Ok(())
     }
@@ -836,6 +950,8 @@ mod tests {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test])
             .env("DRIVERBASE_TELEMETRY_TEST_CHILD", "1")
+            .env_remove("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+            .env_remove("OTEL_EXPORTER_OTLP_PROTOCOL")
             .envs(environment.iter().copied())
             .output()
             .unwrap();
@@ -877,6 +993,13 @@ mod tests {
             Some(valid)
         );
         assert_eq!(validate_trace_parent("").unwrap(), None);
+        assert_eq!(validate_trace_parent("  \t ").unwrap(), None);
+        assert_eq!(
+            validate_trace_parent(&format!("  {valid} \t"))
+                .unwrap()
+                .as_deref(),
+            Some(valid)
+        );
         let parent = parent_context(valid);
         let span = parent.span();
         assert_eq!(
@@ -954,6 +1077,66 @@ mod tests {
             telemetry.configure(Some(Exporter::Otlp), None).unwrap();
             telemetry.shutdown();
         });
+    }
+
+    #[test]
+    fn otlp_rejects_unsupported_protocol() {
+        if std::env::var_os("DRIVERBASE_TELEMETRY_TEST_CHILD").is_some() {
+            let telemetry = Telemetry::new("protocol", "1.0", "test");
+            let result = telemetry.configure(Some(Exporter::Otlp), None);
+            if std::env::var("DRIVERBASE_EXPECT_PROTOCOL_VALID").unwrap() == "true" {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.status, Status::InvalidArguments);
+                assert!(error.message.contains("http/protobuf"));
+                assert!(
+                    error
+                        .message
+                        .contains(&std::env::var("DRIVERBASE_BAD_PROTOCOL_VAR").unwrap())
+                );
+            }
+            telemetry.shutdown();
+            return;
+        }
+        let test = "telemetry::tests::otlp_rejects_unsupported_protocol";
+        run_child(
+            test,
+            &[
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+                ("DRIVERBASE_EXPECT_PROTOCOL_VALID", "false"),
+                ("DRIVERBASE_BAD_PROTOCOL_VAR", "OTEL_EXPORTER_OTLP_PROTOCOL"),
+            ],
+        );
+        run_child(
+            test,
+            &[
+                ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "grpc"),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+                ("DRIVERBASE_EXPECT_PROTOCOL_VALID", "false"),
+                (
+                    "DRIVERBASE_BAD_PROTOCOL_VAR",
+                    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+                ),
+            ],
+        );
+        run_child(
+            test,
+            &[
+                ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+                ("DRIVERBASE_EXPECT_PROTOCOL_VALID", "false"),
+                ("DRIVERBASE_BAD_PROTOCOL_VAR", "OTEL_EXPORTER_OTLP_PROTOCOL"),
+            ],
+        );
+        run_child(
+            test,
+            &[
+                ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+                ("DRIVERBASE_EXPECT_PROTOCOL_VALID", "true"),
+            ],
+        );
     }
 
     #[test]
@@ -1054,6 +1237,121 @@ mod tests {
     }
 
     #[test]
+    fn failing_json_export_releases_remote_parents() {
+        if std::env::var_os("DRIVERBASE_TELEMETRY_TEST_CHILD").is_none() {
+            run_child(
+                "telemetry::tests::failing_json_export_releases_remote_parents",
+                &[("OTEL_TRACES_SAMPLER", "always_on")],
+            );
+            return;
+        }
+        let folder = temp_folder();
+        let telemetry = Telemetry::new("failure", "1.0", "test");
+        telemetry
+            .configure(Some(Exporter::AdbcFile), Some(folder.to_str().unwrap()))
+            .unwrap();
+        fs::remove_dir_all(folder).unwrap();
+        let remote = parent_context("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+        let tracer = telemetry.tracer();
+        for _ in 0..3 {
+            for _ in 0..10 {
+                tracer.start_with_context("failed-export", &remote).end();
+            }
+            telemetry.flush();
+            assert!(telemetry.processor.parents.lock().unwrap().is_empty());
+        }
+        telemetry.shutdown();
+    }
+
+    #[test]
+    fn remote_parent_contexts_are_bounded_without_exports() {
+        if std::env::var_os("DRIVERBASE_TELEMETRY_TEST_CHILD").is_none() {
+            run_child(
+                "telemetry::tests::remote_parent_contexts_are_bounded_without_exports",
+                &[("OTEL_TRACES_SAMPLER", "always_on")],
+            );
+            return;
+        }
+        let folder = temp_folder();
+        let telemetry = Telemetry::new("overflow", "1.0", "test");
+        telemetry
+            .configure(Some(Exporter::AdbcFile), Some(folder.to_str().unwrap()))
+            .unwrap();
+        let remote = parent_context("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+        let tracer = telemetry.tracer();
+        let spans: Vec<_> = (0..MAX_PARENT_CONTEXTS + 32)
+            .map(|_| tracer.start_with_context("pending", &remote))
+            .collect();
+        assert_eq!(
+            telemetry.processor.parents.lock().unwrap().len(),
+            MAX_PARENT_CONTEXTS
+        );
+        drop(spans);
+        telemetry.shutdown();
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn shutdown_disables_telemetry_and_rejects_configuration() {
+        let folder = temp_folder();
+        let telemetry = Telemetry::new("shutdown", "1.0", "test");
+        telemetry
+            .configure(Some(Exporter::AdbcFile), Some(folder.to_str().unwrap()))
+            .unwrap();
+        assert!(telemetry.is_enabled());
+        telemetry.shutdown();
+        assert!(!telemetry.is_enabled());
+        for exporter in [Exporter::AdbcFile, Exporter::None] {
+            assert_eq!(
+                telemetry
+                    .configure(Some(exporter), Some(folder.to_str().unwrap()))
+                    .unwrap_err()
+                    .status,
+                Status::InvalidState
+            );
+        }
+        telemetry.shutdown();
+        fs::remove_dir_all(folder).unwrap();
+
+        let unconfigured = Telemetry::new("unconfigured", "1.0", "test");
+        unconfigured.shutdown();
+        assert_eq!(
+            unconfigured.configure(None, None).unwrap_err().status,
+            Status::InvalidState
+        );
+    }
+
+    #[test]
+    fn file_prefix_is_lowercase_but_scope_preserves_driver_name() {
+        let folder = temp_folder();
+        let telemetry = Telemetry::new("MixedCase", "1.0", "test");
+        assert_eq!(telemetry.scope.name(), "apache.arrow.adbc.MixedCase");
+        telemetry
+            .configure(Some(Exporter::AdbcFile), Some(folder.to_str().unwrap()))
+            .unwrap();
+        telemetry.tracer().start("mixed-case").end();
+        telemetry.flush();
+        let paths = fs::read_dir(&folder)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0]
+                .file_name()
+                .to_str()
+                .unwrap()
+                .starts_with("apache.arrow.adbc.mixedcase-")
+        );
+        assert_eq!(
+            read_spans(&folder)[0]["InstrumentationScope"]["Name"],
+            "apache.arrow.adbc.MixedCase"
+        );
+        telemetry.shutdown();
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
     fn remote_parent_survives_exporter_switch() {
         let folder = temp_folder();
         let telemetry = Telemetry::new("switch", "1.0", "test");
@@ -1087,6 +1385,20 @@ mod tests {
         for name in ["none", "otlp", "console", "adbcfile"] {
             assert_eq!(Exporter::parse(name).unwrap().as_str(), name);
         }
+        assert_eq!(Exporter::parse_option("").unwrap(), None);
+        assert_eq!(Exporter::parse_option(" \t ").unwrap(), None);
+        assert_eq!(
+            Exporter::parse_option("  adbcfile \t").unwrap(),
+            Some(Exporter::AdbcFile)
+        );
+        assert_eq!(
+            Exporter::parse_option("invalid").unwrap_err().status,
+            Status::InvalidArguments
+        );
+        assert_eq!(
+            resolve_exporter(Exporter::parse_option("   ").unwrap(), Some("console")).unwrap(),
+            Exporter::Console
+        );
         assert_eq!(resolve_exporter(None, None).unwrap(), Exporter::None);
         assert_eq!(resolve_exporter(None, Some("")).unwrap(), Exporter::None);
         assert_eq!(
@@ -1146,6 +1458,97 @@ mod tests {
                         .starts_with(prefix.as_ref())
                         && fs::metadata(path).unwrap().len() <= 40
                 })
+        );
+        drop(writer);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn adbcfile_reuses_latest_file_for_other_writers() {
+        let folder = temp_folder();
+        let prefix: Arc<str> = Arc::from("apache.arrow.adbc.shared-");
+        let mut long_lived =
+            RotatingFileWriter::new(folder.clone(), Arc::clone(&prefix), 1024, 2).unwrap();
+        long_lived.write_line(b"{\"Name\":\"first\"}\n").unwrap();
+        for index in 0..2 {
+            let mut short_lived =
+                RotatingFileWriter::new(folder.clone(), Arc::clone(&prefix), 1024, 2).unwrap();
+            short_lived
+                .write_line(format!("{{\"Name\":\"{index}\"}}\n").as_bytes())
+                .unwrap();
+        }
+        long_lived.write_line(b"{\"Name\":\"last\"}\n").unwrap();
+        long_lived.flush().unwrap();
+        let files = long_lived.trace_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read_to_string(&files[0]).unwrap().lines().count(), 4);
+        drop(long_lived);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn adbcfile_recovers_after_failed_write() {
+        let folder = temp_folder();
+        let mut writer = RotatingFileWriter::new(
+            folder.clone(),
+            Arc::from("apache.arrow.adbc.recover-"),
+            1024,
+            2,
+        )
+        .unwrap();
+        let first = b"{\"Name\":\"first\"}\n";
+        let last = b"{\"Name\":\"last\"}\n";
+        writer.write_line(first).unwrap();
+        let path = writer.trace_files().unwrap().pop().unwrap();
+        // Simulate the bytes left by a partial write on a writable real file.
+        writer
+            .file
+            .as_mut()
+            .unwrap()
+            .write_all(b"{\"Name\":\"incomplete")
+            .unwrap();
+        writer.discard_partial_line();
+        assert!(writer.file.is_none());
+        assert_eq!(fs::read(&path).unwrap(), first.to_vec());
+        writer.file = Some(File::open(&path).unwrap());
+        assert!(writer.write_line(b"{\"Name\":\"failed\"}\n").is_err());
+        assert!(writer.file.is_none());
+        assert_eq!(writer.bytes, first.len() as u64);
+        writer.write_line(last).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            [first.as_slice(), last.as_slice()].concat()
+        );
+        drop(writer);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn adbcfile_pruning_failure_does_not_lose_write() {
+        let folder = temp_folder();
+        let mut writer = RotatingFileWriter::new(
+            folder.clone(),
+            Arc::from("apache.arrow.adbc.prune-"),
+            1024,
+            1,
+        )
+        .unwrap();
+        // A matching directory is unremovable with remove_file on all CI platforms.
+        fs::create_dir(folder.join("apache.arrow.adbc.prune-2000-01-01-00-00-00.000000000.jsonl"))
+            .unwrap();
+        writer.write_line(b"{\"Name\":\"kept\"}\n").unwrap();
+        writer.flush().unwrap();
+        let files: Vec<_> = writer
+            .trace_files()
+            .unwrap()
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&files[0]).unwrap(),
+            "{\"Name\":\"kept\"}\n"
         );
         drop(writer);
         fs::remove_dir_all(folder).unwrap();
@@ -1224,6 +1627,27 @@ mod tests {
         assert_eq!(root["InstrumentationScope"]["Version"], "2.3.4");
         assert_eq!(root["Status"]["Code"], "Error");
         assert_eq!(root["Status"]["Description"], "test failure");
+        let event = &root["Events"][0];
+        assert_eq!(event["Name"], "exception");
+        let exception_attribute = |key| {
+            event["Attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|attribute| attribute["Key"] == key)
+                .unwrap_or_else(|| panic!("missing exception attribute {key}"))["Value"]["Value"]
+                .clone()
+        };
+        assert_eq!(
+            exception_attribute("exception.type"),
+            std::any::type_name::<Error>()
+        );
+        assert!(
+            exception_attribute("exception.message")
+                .as_str()
+                .unwrap()
+                .contains("test failure")
+        );
         assert_eq!(
             attribute(root, "db.system.name")["Value"]["Value"],
             "test-system"
