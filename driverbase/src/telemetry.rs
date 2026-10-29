@@ -743,6 +743,7 @@ struct RotatingFileWriter {
     folder: PathBuf,
     prefix: Arc<str>,
     file: Option<File>,
+    path: PathBuf,
     bytes: u64,
     max_bytes: u64,
     max_files: usize,
@@ -768,6 +769,7 @@ impl RotatingFileWriter {
             folder,
             prefix,
             file: None,
+            path: PathBuf::new(),
             bytes: 0,
             max_bytes,
             max_files,
@@ -794,9 +796,14 @@ impl RotatingFileWriter {
     }
 
     fn discard_partial_line(&mut self) {
-        if let Some(file) = self.file.take() {
+        if self.file.take().is_some() {
             // Roll back an incomplete JSONL record to the last committed offset.
-            let _ = file.set_len(self.bytes);
+            // Truncate through a write handle: on Windows an append-only handle
+            // lacks the access right that changing the file length requires.
+            let _ = OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .and_then(|file| file.set_len(self.bytes));
         }
     }
 
@@ -812,6 +819,7 @@ impl RotatingFileWriter {
                 && (bytes == 0 || bytes.saturating_add(line_len as u64) <= self.max_bytes)
             {
                 self.file = Some(file);
+                self.path = path;
                 self.bytes = bytes;
                 return Ok(());
             }
@@ -828,6 +836,7 @@ impl RotatingFileWriter {
                     self.bytes = 0;
                     // Pruning is maintenance, not a reason to lose an export.
                     let _ = self.prune(&path);
+                    self.path = path;
                     return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
