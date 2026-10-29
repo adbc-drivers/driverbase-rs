@@ -18,27 +18,33 @@
 //! Create a [`Telemetry`], add [`Telemetry::app_layer`] to the driver's
 //! tracing subscriber, choose an exporter with [`Telemetry::configure`], and
 //! run each ADBC operation through [`Telemetry::traced`].
+//!
+//! The selected exporter gates recording; when enabled, sampling follows the
+//! SDK's `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` configuration.
+//! Console and file exporters write Go stdouttrace-compatible span JSON.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use adbc_core::error::{Error, Result, Status};
 use chrono::{DateTime, SecondsFormat, Utc};
 use opentelemetry::propagation::{Extractor, TextMapPropagator};
 use opentelemetry::trace::{
-    Link, SamplingResult, SpanKind, Status as SpanStatus, TraceContextExt, TraceId,
+    Link, SamplingResult, Span as _, SpanContext, SpanId, SpanKind, Status as SpanStatus,
+    TraceContextExt, TraceId,
 };
 use opentelemetry::{Context, InstrumentationScope, KeyValue, Value};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{
-    BatchSpanProcessor, Sampler, SdkTracerProvider, ShouldSample, Span as SdkSpan, SpanData,
-    SpanExporter, SpanProcessor,
+    BatchSpanProcessor, Config, Sampler, SdkTracerProvider, ShouldSample, Span as SdkSpan,
+    SpanData, SpanExporter, SpanProcessor,
 };
 use serde_json::{Value as JsonValue, json};
 use tracing_opentelemetry::{OpenTelemetryLayer, OpenTelemetrySpanExt};
@@ -108,7 +114,7 @@ impl Extractor for ParentHeader<'_> {
 
 /// Extract a remote W3C parent for a driver operation span.
 pub fn parent_context(value: &str) -> Context {
-    TraceContextPropagator::new().extract(&ParentHeader(value))
+    TraceContextPropagator::new().extract_with_context(&Context::new(), &ParentHeader(value))
 }
 
 /// Validate a W3C traceparent, or clear the configured parent when empty.
@@ -133,7 +139,6 @@ pub struct Telemetry {
     processor: SwitchableProcessor,
     enabled: Arc<AtomicBool>,
     configured: Mutex<Option<(Exporter, Option<PathBuf>)>>,
-    resource: Resource,
     scope: InstrumentationScope,
     file_prefix: Arc<str>,
     db_system_name: Box<str>,
@@ -150,8 +155,11 @@ impl Telemetry {
             .with_service_name("apache.arrow.adbc")
             .build();
         let provider = SdkTracerProvider::builder()
-            .with_resource(resource.clone())
-            .with_sampler(SwitchableSampler(Arc::clone(&enabled)))
+            .with_resource(resource)
+            .with_sampler(SwitchableSampler {
+                enabled: Arc::clone(&enabled),
+                delegate: Config::default().sampler,
+            })
             .with_span_processor(processor.clone())
             .build();
         Self {
@@ -159,7 +167,6 @@ impl Telemetry {
             processor,
             enabled,
             configured: Mutex::new(None),
-            resource,
             scope: InstrumentationScope::builder(format!("apache.arrow.adbc.{driver_name}"))
                 .with_version(driver_version.to_owned())
                 .with_schema_url(opentelemetry_semantic_conventions::SCHEMA_URL)
@@ -220,18 +227,46 @@ impl Telemetry {
         if configured.as_ref() == Some(&(exporter, folder.clone())) {
             return Ok(());
         }
+        let json_output = matches!(exporter, Exporter::Console | Exporter::AdbcFile);
         let processor = match exporter {
             Exporter::None => None,
             Exporter::Otlp => {
+                use opentelemetry_otlp::WithHttpConfig;
+
+                let timeout = [
+                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT,
+                ]
+                .into_iter()
+                .find_map(|name| std::env::var(name).ok()?.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT);
+                // Construct the blocking client off the caller's async runtime.
+                let client = std::thread::Builder::new()
+                    .spawn(move || {
+                        reqwest::blocking::Client::builder()
+                            .timeout(timeout)
+                            .build()
+                    })
+                    .map_err(|error| telemetry_error(error, Status::IO))?
+                    .join()
+                    .map_err(|_| {
+                        telemetry_error("HTTP client construction panicked", Status::Internal)
+                    })?
+                    .map_err(|error| telemetry_error(error, Status::InvalidArguments))?;
                 let exporter = opentelemetry_otlp::SpanExporter::builder()
                     .with_http()
+                    .with_http_client(client)
                     .build()
                     .map_err(|error| telemetry_error(error, Status::InvalidArguments))?;
                 Some(BatchSpanProcessor::builder(exporter).build())
             }
-            Exporter::Console => {
-                Some(BatchSpanProcessor::builder(JsonExporter::console(&self.resource)).build())
-            }
+            Exporter::Console => Some(
+                BatchSpanProcessor::builder(JsonExporter::console(Arc::clone(
+                    &self.processor.parents,
+                )))
+                .build(),
+            ),
             Exporter::AdbcFile => {
                 let directory = match folder.as_ref() {
                     Some(directory) => directory.clone(),
@@ -245,14 +280,18 @@ impl Telemetry {
                 )
                 .map_err(|error| telemetry_error(error, Status::IO))?;
                 Some(
-                    BatchSpanProcessor::builder(JsonExporter::file(writer, &self.resource)).build(),
+                    BatchSpanProcessor::builder(JsonExporter::file(
+                        writer,
+                        Arc::clone(&self.processor.parents),
+                    ))
+                    .build(),
                 )
             }
         };
         // Stop sampling before swapping the old processor, then enable the
         // newly installed processor. The subscriber and tracing parents stay fixed.
         self.enabled.store(false, Ordering::Release);
-        let previous = self.processor.replace(processor);
+        let previous = self.processor.replace(processor, json_output);
         self.enabled
             .store(exporter != Exporter::None, Ordering::Release);
         *configured = Some((exporter, folder));
@@ -330,7 +369,10 @@ fn telemetry_error(error: impl std::fmt::Display, status: Status) -> Error {
 }
 
 #[derive(Clone, Debug)]
-struct SwitchableSampler(Arc<AtomicBool>);
+struct SwitchableSampler {
+    enabled: Arc<AtomicBool>,
+    delegate: Box<dyn ShouldSample>,
+}
 
 impl ShouldSample for SwitchableSampler {
     fn should_sample(
@@ -342,10 +384,15 @@ impl ShouldSample for SwitchableSampler {
         attributes: &[KeyValue],
         links: &[Link],
     ) -> SamplingResult {
-        static PARENT_BASED: LazyLock<Sampler> =
-            LazyLock::new(|| Sampler::ParentBased(Box::new(Sampler::AlwaysOn)));
-        if self.0.load(Ordering::Acquire) {
-            PARENT_BASED.should_sample(parent_context, trace_id, name, span_kind, attributes, links)
+        if self.enabled.load(Ordering::Acquire) {
+            self.delegate.should_sample(
+                parent_context,
+                trace_id,
+                name,
+                span_kind,
+                attributes,
+                links,
+            )
         } else {
             Sampler::AlwaysOff.should_sample(
                 parent_context,
@@ -359,45 +406,80 @@ impl ShouldSample for SwitchableSampler {
     }
 }
 
+type ParentContexts = Arc<Mutex<HashMap<SpanId, SpanContext>>>;
+
+#[derive(Default, Debug)]
+struct ProcessorState {
+    current: Option<BatchSpanProcessor>,
+    resource: Option<Resource>,
+    json_output: bool,
+}
+
 #[derive(Clone, Default, Debug)]
 struct SwitchableProcessor {
-    current: Arc<RwLock<Option<BatchSpanProcessor>>>,
+    state: Arc<RwLock<ProcessorState>>,
+    parents: ParentContexts,
 }
 
 impl SwitchableProcessor {
-    fn replace(&self, next: Option<BatchSpanProcessor>) -> Option<BatchSpanProcessor> {
-        std::mem::replace(
-            &mut *self.current.write().unwrap_or_else(|err| err.into_inner()),
-            next,
-        )
+    fn replace(
+        &self,
+        mut next: Option<BatchSpanProcessor>,
+        json_output: bool,
+    ) -> Option<BatchSpanProcessor> {
+        let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
+        if let (Some(next), Some(resource)) = (next.as_mut(), state.resource.as_ref()) {
+            next.set_resource(resource);
+        }
+        state.json_output = json_output;
+        std::mem::replace(&mut state.current, next)
     }
 }
 
 impl SpanProcessor for SwitchableProcessor {
-    fn on_start(&self, _span: &mut SdkSpan, _context: &Context) {}
+    fn on_start(&self, span: &mut SdkSpan, context: &Context) {
+        let parent = context.span();
+        if span.is_recording() && parent.span_context().is_valid() {
+            self.parents
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(span.span_context().span_id(), parent.span_context().clone());
+        }
+    }
 
     fn on_end(&self, span: SpanData) {
-        if let Some(current) = self
-            .current
-            .read()
-            .unwrap_or_else(|err| err.into_inner())
-            .as_ref()
-        {
+        let state = self.state.read().unwrap_or_else(|err| err.into_inner());
+        if !state.json_output {
+            self.parents
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .remove(&span.span_context.span_id());
+        }
+        if let Some(current) = state.current.as_ref() {
             current.on_end(span);
         }
     }
 
     fn force_flush(&self) -> OTelSdkResult {
-        self.current
+        self.state
             .read()
             .unwrap_or_else(|err| err.into_inner())
+            .current
             .as_ref()
             .map_or(Ok(()), SpanProcessor::force_flush)
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        self.replace(None)
+        self.replace(None, false)
             .map_or(Ok(()), |current| current.shutdown_with_timeout(timeout))
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        let mut state = self.state.write().unwrap_or_else(|err| err.into_inner());
+        state.resource = Some(resource.clone());
+        if let Some(current) = state.current.as_mut() {
+            current.set_resource(resource);
+        }
     }
 }
 
@@ -411,21 +493,33 @@ enum JsonOutput {
 struct JsonExporter {
     output: JsonOutput,
     resource: Resource,
+    parents: ParentContexts,
 }
 
 impl JsonExporter {
-    fn console(resource: &Resource) -> Self {
+    fn console(parents: ParentContexts) -> Self {
         Self {
             output: JsonOutput::Stdout,
-            resource: resource.clone(),
+            resource: Resource::builder_empty().build(),
+            parents,
         }
     }
 
-    fn file(writer: RotatingFileWriter, resource: &Resource) -> Self {
+    fn file(writer: RotatingFileWriter, parents: ParentContexts) -> Self {
         Self {
             output: JsonOutput::File(Mutex::new(writer)),
-            resource: resource.clone(),
+            resource: Resource::builder_empty().build(),
+            parents,
         }
+    }
+
+    fn span_json(&self, span: &SpanData) -> JsonValue {
+        let parent = self
+            .parents
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&span.span_context.span_id());
+        span_json(span, &self.resource, parent)
     }
 
     fn write_spans(&self, spans: &[SpanData]) -> io::Result<()> {
@@ -434,7 +528,7 @@ impl JsonExporter {
                 let stdout = io::stdout();
                 let mut writer = stdout.lock();
                 for span in spans {
-                    serde_json::to_writer(&mut writer, &span_json(span, &self.resource))?;
+                    serde_json::to_writer(&mut writer, &self.span_json(span))?;
                     writer.write_all(b"\n")?;
                 }
                 writer.flush()
@@ -442,7 +536,7 @@ impl JsonExporter {
             JsonOutput::File(writer) => {
                 let mut writer = writer.lock().unwrap_or_else(|err| err.into_inner());
                 for span in spans {
-                    let mut line = serde_json::to_vec(&span_json(span, &self.resource))?;
+                    let mut line = serde_json::to_vec(&self.span_json(span))?;
                     line.push(b'\n');
                     writer.write_line(&line)?;
                 }
@@ -456,6 +550,10 @@ impl SpanExporter for JsonExporter {
     async fn export(&self, spans: Vec<SpanData>) -> OTelSdkResult {
         self.write_spans(&spans)
             .map_err(|error| OTelSdkError::InternalFailure(error.to_string()))
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.resource = resource.clone();
     }
 }
 
@@ -491,19 +589,21 @@ fn timestamp(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
-fn span_json(span: &SpanData, resource: &Resource) -> JsonValue {
+fn span_json(span: &SpanData, resource: &Resource, parent: Option<SpanContext>) -> JsonValue {
     // Root spans get an all-zero parent, as Go's stdouttrace writes.
-    let parent = if span.parent_span_id == opentelemetry::trace::SpanId::INVALID {
-        opentelemetry::trace::SpanContext::empty_context()
-    } else {
-        opentelemetry::trace::SpanContext::new(
-            span.span_context.trace_id(),
-            span.parent_span_id,
-            span.span_context.trace_flags(),
-            true,
-            span.span_context.trace_state().clone(),
-        )
-    };
+    let parent = parent.unwrap_or_else(|| {
+        if span.parent_span_id == SpanId::INVALID {
+            SpanContext::empty_context()
+        } else {
+            SpanContext::new(
+                span.span_context.trace_id(),
+                span.parent_span_id,
+                span.span_context.trace_flags(),
+                false,
+                span.span_context.trace_state().clone(),
+            )
+        }
+    });
     let (status_code, description) = match &span.status {
         SpanStatus::Unset => ("Unset", ""),
         SpanStatus::Ok => ("Ok", ""),
@@ -527,17 +627,21 @@ fn span_json(span: &SpanData, resource: &Resource) -> JsonValue {
         "SpanContext": span_context_json(&span.span_context),
         "Parent": span_context_json(&parent),
         "SpanKind": match span.span_kind {
-            SpanKind::Internal => "Internal",
-            SpanKind::Server => "Server",
-            SpanKind::Client => "Client",
-            SpanKind::Producer => "Producer",
-            SpanKind::Consumer => "Consumer",
+            SpanKind::Internal => 1,
+            SpanKind::Server => 2,
+            SpanKind::Client => 3,
+            SpanKind::Producer => 4,
+            SpanKind::Consumer => 5,
         },
         "StartTime": timestamp(span.start_time),
         "EndTime": timestamp(span.end_time),
         "Attributes": span.attributes.iter().map(json_attribute).collect::<Vec<_>>(),
         "Events": events,
-        "Links": [],
+        "Links": span.links.links.iter().map(|link| json!({
+            "SpanContext": span_context_json(&link.span_context),
+            "Attributes": link.attributes.iter().map(json_attribute).collect::<Vec<_>>(),
+            "DroppedAttributeCount": link.dropped_attributes_count,
+        })).collect::<Vec<_>>(),
         "Status": { "Code": status_code, "Description": description },
         "DroppedAttributes": span.dropped_attributes_count,
         "DroppedEvents": span.events.dropped_count,
@@ -719,12 +823,28 @@ pub fn status_name(status: Status) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::trace::Tracer;
     use tracing_subscriber::layer::Identity;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::registry::Registry;
 
     fn temp_folder() -> PathBuf {
         std::env::temp_dir().join(format!("adbc-traces-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn run_child(test: &str, environment: &[(&str, &str)]) {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env("DRIVERBASE_TELEMETRY_TEST_CHILD", "1")
+            .envs(environment.iter().copied())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "child test failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     fn attribute<'a>(span: &'a JsonValue, key: &str) -> &'a JsonValue {
@@ -779,6 +899,183 @@ mod tests {
                 Status::InvalidArguments
             );
         }
+        let _active_span = parent.attach();
+        assert_eq!(
+            validate_trace_parent("not-a-parent").unwrap_err().status,
+            Status::InvalidArguments
+        );
+        assert!(
+            !parent_context("not-a-parent")
+                .span()
+                .span_context()
+                .is_valid()
+        );
+    }
+
+    #[test]
+    fn sampler_honors_sdk_environment() {
+        if std::env::var_os("DRIVERBASE_TELEMETRY_TEST_CHILD").is_some() {
+            let telemetry = Telemetry::new("sampler", "1.0", "test");
+            telemetry.enabled.store(true, Ordering::Release);
+            let span = telemetry.tracer().start("sample");
+            assert_eq!(
+                span.is_recording(),
+                std::env::var("DRIVERBASE_EXPECT_SAMPLED").unwrap() == "true"
+            );
+            drop(span);
+            telemetry.shutdown();
+        } else {
+            for (sampler, argument, expected) in [
+                ("always_on", "1.0", "true"),
+                ("always_off", "1.0", "false"),
+                ("traceidratio", "0.0", "false"),
+                ("traceidratio", "1.0", "true"),
+                ("parentbased_traceidratio", "0.0", "false"),
+            ] {
+                run_child(
+                    "telemetry::tests::sampler_honors_sdk_environment",
+                    &[
+                        ("OTEL_TRACES_SAMPLER", sampler),
+                        ("OTEL_TRACES_SAMPLER_ARG", argument),
+                        ("DRIVERBASE_EXPECT_SAMPLED", expected),
+                    ],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn otlp_configures_without_a_collector() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let telemetry = Telemetry::new("otlp", "1.0", "test");
+            telemetry.configure(Some(Exporter::Otlp), None).unwrap();
+            telemetry.shutdown();
+        });
+    }
+
+    #[test]
+    fn resource_is_exported_after_reconfiguration() {
+        if std::env::var_os("DRIVERBASE_TELEMETRY_TEST_CHILD").is_none() {
+            run_child(
+                "telemetry::tests::resource_is_exported_after_reconfiguration",
+                &[
+                    ("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=staging"),
+                    ("OTEL_TRACES_SAMPLER", "always_on"),
+                ],
+            );
+            return;
+        }
+
+        let folder = temp_folder();
+        let telemetry = Telemetry::new("resource", "1.0", "test");
+        for _ in 0..2 {
+            telemetry
+                .configure(Some(Exporter::AdbcFile), Some(folder.to_str().unwrap()))
+                .unwrap();
+            telemetry.tracer().start("resource-span").end();
+            telemetry.flush();
+            telemetry.configure(Some(Exporter::None), None).unwrap();
+        }
+        let spans = read_spans(&folder);
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            let attributes = span["Resource"].as_array().unwrap();
+            let resource_attribute = |key| {
+                attributes
+                    .iter()
+                    .find(|attr| attr["Key"] == key)
+                    .unwrap_or_else(|| panic!("missing resource attribute {key}"))["Value"]["Value"]
+                    .clone()
+            };
+            assert_eq!(resource_attribute("service.name"), "apache.arrow.adbc");
+            assert_eq!(resource_attribute("deployment.environment"), "staging");
+        }
+        telemetry.shutdown();
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn json_spans_serialize_kinds_and_links() {
+        let folder = temp_folder();
+        let telemetry = Telemetry::new("kinds", "1.0", "test");
+        telemetry
+            .configure(Some(Exporter::AdbcFile), Some(folder.to_str().unwrap()))
+            .unwrap();
+        let tracer = telemetry.tracer();
+        let linked = parent_context("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            .span()
+            .span_context()
+            .clone();
+        for (kind, number) in [
+            (SpanKind::Internal, 1),
+            (SpanKind::Server, 2),
+            (SpanKind::Client, 3),
+            (SpanKind::Producer, 4),
+            (SpanKind::Consumer, 5),
+        ] {
+            let mut builder = tracer
+                .span_builder(format!("kind-{number}"))
+                .with_kind(kind);
+            if number == 3 {
+                builder = builder.with_links(vec![Link::new(
+                    linked.clone(),
+                    vec![KeyValue::new("link.type", "related")],
+                    0,
+                )]);
+            }
+            builder.start(&tracer).end();
+        }
+        telemetry.flush();
+        let spans = read_spans(&folder);
+        assert_eq!(spans.len(), 5);
+        for number in 1..=5 {
+            let span = spans
+                .iter()
+                .find(|span| span["Name"] == format!("kind-{number}"))
+                .unwrap();
+            assert_eq!(span["SpanKind"], number);
+            if number == 3 {
+                assert_eq!(span["Links"][0]["SpanContext"], span_context_json(&linked));
+                assert_eq!(span["Links"][0]["Attributes"][0]["Key"], "link.type");
+                assert_eq!(
+                    span["Links"][0]["Attributes"][0]["Value"]["Value"],
+                    "related"
+                );
+                assert_eq!(span["Links"][0]["DroppedAttributeCount"], 0);
+            } else {
+                assert_eq!(span["Links"], json!([]));
+            }
+        }
+        telemetry.shutdown();
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn remote_parent_survives_exporter_switch() {
+        let folder = temp_folder();
+        let telemetry = Telemetry::new("switch", "1.0", "test");
+        telemetry
+            .configure(Some(Exporter::AdbcFile), Some(folder.to_str().unwrap()))
+            .unwrap();
+        let remote = parent_context("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+        let mut span = telemetry.tracer().start_with_context("switched", &remote);
+        telemetry.configure(Some(Exporter::None), None).unwrap();
+        telemetry
+            .configure(Some(Exporter::AdbcFile), Some(folder.to_str().unwrap()))
+            .unwrap();
+        span.end();
+        telemetry.flush();
+        let spans = read_spans(&folder);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0]["Parent"],
+            span_context_json(remote.span().span_context())
+        );
+        telemetry.shutdown();
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]
@@ -908,7 +1205,14 @@ mod tests {
             "4bf92f3577b34da6a3ce929d0e0e4736"
         );
         assert_eq!(root["Parent"]["SpanID"], "00f067aa0ba902b7");
+        assert_eq!(root["Parent"]["Remote"], true);
+        assert_eq!(root["Parent"]["TraceFlags"], "01");
         assert_eq!(child["Parent"]["SpanID"], root["SpanContext"]["SpanID"]);
+        assert_eq!(child["Parent"]["Remote"], false);
+        assert_eq!(
+            child["Parent"]["TraceFlags"],
+            root["SpanContext"]["TraceFlags"]
+        );
         assert_eq!(
             child["SpanContext"]["TraceID"],
             root["SpanContext"]["TraceID"]

@@ -25,6 +25,7 @@ telemetry = [
     "dep:opentelemetry-otlp",
     "dep:opentelemetry-semantic-conventions",
     "dep:opentelemetry_sdk",
+    "dep:reqwest",
     "dep:serde_json",
     "dep:tracing",
     "dep:tracing-opentelemetry",
@@ -42,11 +43,15 @@ chrono = { version = "0.4", optional = true }
 # dependencies trace through OpenTelemetry must resolve the same versions to
 # share one subscriber and parent context with these spans.
 opentelemetry = { version = "0.30", optional = true }
-opentelemetry-otlp = { version = "0.30", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"], optional = true }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 opentelemetry-semantic-conventions = { version = "0.30", optional = true }
 opentelemetry_sdk = { version = "0.30", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"], optional = true }
 serde_json = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-opentelemetry = { version = "0.31", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt"] }
