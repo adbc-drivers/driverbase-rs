@@ -17,21 +17,29 @@
 # driverbase-rs
 Base framework and other libraries for developing ADBC drivers in Rust.
 
-## OpenTelemetry tracing
+## Tracing
 
-Enable the optional `telemetry` feature to use `driverbase::telemetry::Telemetry`.
-Construct it with a driver name, version, and `db.system.name`, then add
-`Telemetry::app_layer()` to the driver's tracing subscriber. This layer traces
-only the `driverbase` target; compose any driver-specific layers separately
-without filtering layers that need to inspect its parent span context.
+The optional `driverbase/telemetry` feature provides an OpenTelemetry tracing
+layer for ADBC drivers. Tracing is disabled until the driver calls
+`Telemetry::configure`, which selects an exporter from the database option
+`adbc.telemetry.traces_exporter` or, when unset, `OTEL_TRACES_EXPORTER`.
+Use `Exporter::parse_option` to treat a blank database option as unset.
+Exporters are `none`, `otlp` (HTTP/protobuf, including HTTPS with Rustls and
+webpki roots), `console`, and `adbcfile` (rotating JSONL files). Console and
+file spans use the Go `stdouttrace` JSON shape. The database option
+`adbc.telemetry.traces_folder_path` selects the `adbcfile` directory. The W3C
+parent option `adbc.telemetry.trace_parent` can be set on a database,
+connection, or statement. `Telemetry::shutdown` is final; configuring that
+instance again returns `InvalidState`.
 
-`Telemetry::configure` selects `none`, `otlp` (HTTP/protobuf), `console`, or
-`adbcfile`. An explicit exporter overrides `OTEL_TRACES_EXPORTER`; file traces
-are rotating JSONL in Go stdouttrace format. Call `Telemetry::traced` around
-ADBC operations with the dispatch and an optional validated W3C traceparent.
-The callback can record `db.response.returned_rows` or use
-`tracing_opentelemetry::OpenTelemetrySpanExt::set_attribute` for driver-specific
-attributes.
+Sampling follows `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` whenever
+tracing is enabled. `OTEL_RESOURCE_ATTRIBUTES` is included in exported spans,
+alongside the `apache.arrow.adbc` service name. The OTLP HTTP exporter reads
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_TRACES_HEADERS` / `OTEL_EXPORTER_OTLP_HEADERS`, and
+`OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` / `OTEL_EXPORTER_OTLP_TIMEOUT`. If set,
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` / `OTEL_EXPORTER_OTLP_PROTOCOL` must be
+`http/protobuf`; gRPC is not supported.
 
 ## GetObjects metadata
 
