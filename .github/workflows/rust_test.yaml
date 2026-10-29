@@ -53,13 +53,17 @@ jobs:
         with:
           components: "clippy"
 
-      - name: build
-        run: |
-          cargo build --all-features
+      - name: build (default features)
+        run: cargo build
 
-      - name: test
-        run: |
-          cargo test --all-features
+      - name: test (default features)
+        run: cargo test
+
+      - name: build (all features)
+        run: cargo build --all-features
+
+      - name: test (all features)
+        run: cargo test --all-features
 
       - name: clippy
         run: |
