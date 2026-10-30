@@ -22,6 +22,8 @@
 //! The selected exporter gates recording; when enabled, sampling follows the
 //! SDK's `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` configuration.
 //! Console and file exporters write Go stdouttrace-compatible span JSON.
+//! Exported spans carry the `apache.arrow.adbc` service name and any
+//! `OTEL_RESOURCE_ATTRIBUTES`.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -68,8 +70,9 @@ const MAX_PARENT_CONTEXTS: usize = 2048;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exporter {
     None,
-    /// OTLP over HTTP/protobuf. The HTTP exporter reads endpoint, headers, and
-    /// timeout environment variables; other protocols are rejected.
+    /// OTLP over HTTP/protobuf, including HTTPS using Rustls with webpki roots.
+    /// The HTTP exporter reads endpoint, headers, and timeout environment
+    /// variables; other protocols are rejected.
     Otlp,
     /// JSON lines on stdout, using the field names of Go's `stdouttrace`.
     Console,
