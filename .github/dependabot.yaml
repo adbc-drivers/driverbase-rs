@@ -24,6 +24,12 @@ updates:
         patterns:
           - "arrow-*"
           - "adbc_*"
+      # tracing-opentelemetry releases track specific opentelemetry versions.
+      tracing-opentelemetry:
+        applies-to: version-updates
+        patterns:
+          - "opentelemetry*"
+          - "tracing*"
     schedule:
       interval: "weekly"
     cooldown:
