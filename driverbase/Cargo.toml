@@ -38,6 +38,7 @@ adbc_core = ">=0.24.0,<0.26.0"
 arrow-array = ">=58.3,<61"
 arrow-buffer = ">=58.3,<61"
 arrow-schema = ">=58.3,<61"
+async-trait = "0.1"
 chrono = { version = "0.4", optional = true }
 # tracing-opentelemetry 0.31 pairs with opentelemetry 0.30. A driver whose own
 # dependencies trace through OpenTelemetry must resolve the same versions to
@@ -46,6 +47,7 @@ opentelemetry = { version = "0.30", optional = true }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 opentelemetry-semantic-conventions = { version = "0.30", optional = true }
 opentelemetry_sdk = { version = "0.30", optional = true }
+regex-lite = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"], optional = true }
 serde_json = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }
