@@ -80,6 +80,10 @@ where
         self.collection.take()
     }
 
+    pub fn as_ref(&self) -> Option<&(dyn MetadataCollectionQuery<Args, E> + Send)> {
+        self.collection.as_deref()
+    }
+
     pub fn set_option(
         &mut self,
         key: &adbc_core::options::OptionStatement,
@@ -134,34 +138,15 @@ where
 }
 
 pub mod schema {
-    use std::sync::{Arc, LazyLock};
+    use std::sync::LazyLock;
 
     use arrow_schema::{DataType, Field, Schema};
-
-    pub static META_FILTER: LazyLock<Schema> = LazyLock::new(|| {
-        Schema::new(vec![
-            Field::new("filter_name", DataType::Utf8, false),
-            Field::new("filter_type", DataType::Int8, false),
-            Field::new("filter_required", DataType::Boolean, false),
-            Field::new("filter_remarks", DataType::Utf8, true),
-        ])
-    });
 
     /// The schema for the "meta" collection.
     pub static META: LazyLock<Schema> = LazyLock::new(|| {
         Schema::new(vec![
             Field::new("collection_name", DataType::Utf8, false),
             Field::new("collection_remarks", DataType::Utf8, true),
-            // XXX: proposal uses JSON
-            Field::new("collection_schema", DataType::Utf8, false),
-            Field::new(
-                "collection_filters",
-                DataType::List(Arc::new(Field::new_list_field(
-                    DataType::Struct(META_FILTER.fields.clone()),
-                    true,
-                ))),
-                true,
-            ),
         ])
     });
 
@@ -197,6 +182,55 @@ pub mod schema {
     });
 }
 
+/// Get the Arrow schema representation of the supported filters.
+pub fn get_filter_schema(filters: &[FilterDescription]) -> Schema {
+    let mut fields = Vec::new();
+    for filter in filters {
+        let mut types = Vec::new();
+        if filter.filter_type_string {
+            types.push(arrow_schema::DataType::Utf8);
+        }
+        if filter.filter_type_bytes {
+            types.push(arrow_schema::DataType::Binary);
+        }
+        if filter.filter_type_double {
+            types.push(arrow_schema::DataType::Float64);
+        }
+        if filter.filter_type_int {
+            types.push(arrow_schema::DataType::Int64);
+        }
+
+        let data_type = match <[_; 1]>::try_from(types) {
+            Ok([ty]) => ty,
+            Err(types) => arrow_schema::DataType::Union(
+                arrow_schema::UnionFields::from_fields(
+                    types
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, t)| arrow_schema::Field::new(format!("field_{i}"), t, false)),
+                ),
+                arrow_schema::UnionMode::Sparse,
+            ),
+        };
+
+        let name = format!(
+            "adbc.metadata.filter{}.{}",
+            if filter.is_pattern { "_pattern" } else { "" },
+            filter.name
+        );
+        let mut field = arrow_schema::Field::new(name, data_type, !filter.required);
+        if let Some(ref remarks) = filter.remarks {
+            field.set_metadata(std::collections::HashMap::from([(
+                "ADBC:metadata:filter:remarks".to_string(),
+                remarks.clone(),
+            )]));
+        }
+
+        fields.push(field);
+    }
+    Schema::new(fields)
+}
+
 /// The implementation of a metadata collection; it records filters and
 /// generates the result metadata.
 #[async_trait::async_trait]
@@ -205,6 +239,10 @@ where
     E: crate::error::ErrorHelper,
 {
     fn add_filter(&mut self, name: &str, filter: Filter) -> Result<(), E>;
+    fn schema(&self) -> Schema;
+    fn supported_filters(&self) -> Vec<FilterDescription> {
+        Vec::new()
+    }
     async fn execute(&self, args: Args) -> Result<Box<dyn RecordBatchReader + Send + 'static>, E>;
 }
 
@@ -227,10 +265,6 @@ pub trait MetadataCollection<Args, E>: Send + Sync {
     fn name(&self) -> &'static str;
     fn remarks(&self) -> Option<String> {
         None
-    }
-    fn schema(&self) -> Schema;
-    fn supported_filters(&self) -> Vec<FilterDescription> {
-        Vec::new()
     }
     fn init(&self) -> Box<dyn MetadataCollectionQuery<Args, E> + Send>;
 }
@@ -310,94 +344,25 @@ impl<Args: Send, E: crate::error::ErrorHelper> MetadataCollectionQuery<Args, E>
         }
     }
 
+    fn schema(&self) -> Schema {
+        schema::META.clone()
+    }
+
     async fn execute(&self, _args: Args) -> Result<Box<dyn RecordBatchReader + Send + 'static>, E> {
         let mut names = arrow_array::builder::StringBuilder::new();
         let mut remarks = arrow_array::builder::StringBuilder::new();
-        let mut schemas = arrow_array::builder::StringBuilder::new();
-        let mut filters = {
-            let filter_items = arrow_array::builder::StructBuilder::new(
-                schema::META_FILTER.fields.clone(),
-                vec![
-                    Box::new(arrow_array::builder::StringBuilder::new()),
-                    Box::new(arrow_array::builder::Int8Builder::new()),
-                    Box::new(arrow_array::builder::BooleanBuilder::new()),
-                    Box::new(arrow_array::builder::StringBuilder::new()),
-                ],
-            );
-
-            arrow_array::builder::ListBuilder::new(filter_items)
-        };
 
         names.append_value("meta");
         remarks.append_option(Some("Available metadata collections".to_string()));
-        schemas.append_value(schema::META.to_string());
-        filters.append_null();
 
         for (name, collection) in self.supported_collections.collections.iter() {
             names.append_value(name);
             remarks.append_option(collection.remarks());
-            schemas.append_value(collection.schema().to_string());
-
-            let supported_filters = collection.supported_filters();
-            if supported_filters.is_empty() {
-                filters.append_null();
-            } else {
-                for filter in supported_filters {
-                    let name = format!(
-                        "adbc.metadata.filter{}.{}",
-                        if filter.is_pattern { "_pattern" } else { "" },
-                        filter.name
-                    );
-                    filters
-                        .values()
-                        .field_builder::<arrow_array::builder::StringBuilder>(0)
-                        .unwrap()
-                        .append_value(&name);
-
-                    let mut filter_type = 0;
-                    if filter.filter_type_string {
-                        filter_type |= 1;
-                    }
-                    if filter.filter_type_bytes {
-                        filter_type |= 2;
-                    }
-                    if filter.filter_type_double {
-                        filter_type |= 4;
-                    }
-                    if filter.filter_type_int {
-                        filter_type |= 8;
-                    }
-                    filters
-                        .values()
-                        .field_builder::<arrow_array::builder::Int8Builder>(1)
-                        .unwrap()
-                        .append_value(filter_type);
-
-                    filters
-                        .values()
-                        .field_builder::<arrow_array::builder::BooleanBuilder>(2)
-                        .unwrap()
-                        .append_value(filter.required);
-                    filters
-                        .values()
-                        .field_builder::<arrow_array::builder::StringBuilder>(3)
-                        .unwrap()
-                        .append_option(filter.remarks.clone());
-
-                    filters.values().append(true);
-                }
-                filters.append(true);
-            }
         }
 
         let batch = arrow_array::RecordBatch::try_new(
             Arc::new(schema::META.clone()),
-            vec![
-                Arc::new(names.finish()),
-                Arc::new(remarks.finish()),
-                Arc::new(schemas.finish()),
-                Arc::new(filters.finish()),
-            ],
+            vec![Arc::new(names.finish()), Arc::new(remarks.finish())],
         )?;
 
         let reader =
@@ -409,32 +374,36 @@ impl<Args: Send, E: crate::error::ErrorHelper> MetadataCollectionQuery<Args, E>
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field};
+    use googletest::prelude::*;
+
     #[test]
     fn test_filter_exact() {
-        let filter = super::Filter::new_exact("test".to_string());
+        let filter = Filter::new_exact("test".to_string());
         assert!(filter.matches("test"));
         assert!(!filter.matches("test1"));
     }
 
     #[test]
     fn test_filter_pattern() {
-        let filter = super::Filter::new_pattern("test%".to_string()).unwrap();
+        let filter = Filter::new_pattern("test%".to_string()).unwrap();
         assert!(filter.matches("test"));
         assert!(filter.matches("test1"));
         assert!(!filter.matches("atest"));
 
-        let filter = super::Filter::new_pattern("test_".to_string()).unwrap();
+        let filter = Filter::new_pattern("test_".to_string()).unwrap();
         assert!(!filter.matches("test"));
         assert!(filter.matches("test1"));
         assert!(!filter.matches("atest"));
 
-        let filter = super::Filter::new_pattern("%test%".to_string()).unwrap();
+        let filter = Filter::new_pattern("%test%".to_string()).unwrap();
         assert!(filter.matches("test"));
         assert!(filter.matches("test1"));
         assert!(filter.matches("atest"));
         assert!(!filter.matches("at3st"));
 
-        let filter = super::Filter::new_pattern("*".to_string()).unwrap();
+        let filter = Filter::new_pattern("*".to_string()).unwrap();
         assert!(!filter.matches("test"));
         assert!(!filter.matches("test1"));
         assert!(!filter.matches("atest"));
@@ -450,8 +419,8 @@ mod tests {
 
     #[test]
     fn test_state() {
-        let mut state = super::MetadataCollectionState::<(), ErrorHelper>::new(
-            super::SupportedMetadataCollections::new(std::collections::HashMap::new()),
+        let mut state = MetadataCollectionState::<(), ErrorHelper>::new(
+            SupportedMetadataCollections::new(std::collections::HashMap::new()),
         );
 
         assert!(!state.is_set());
@@ -460,8 +429,8 @@ mod tests {
 
     #[test]
     fn test_state_no_filters_before_collection() {
-        let mut state = super::MetadataCollectionState::<(), ErrorHelper>::new(
-            super::SupportedMetadataCollections::new(std::collections::HashMap::new()),
+        let mut state = MetadataCollectionState::<(), ErrorHelper>::new(
+            SupportedMetadataCollections::new(std::collections::HashMap::new()),
         );
 
         let err = state
@@ -493,8 +462,8 @@ mod tests {
 
     #[test]
     fn test_state_ignore_unrelated_options() {
-        let mut state = super::MetadataCollectionState::<(), ErrorHelper>::new(
-            super::SupportedMetadataCollections::new(std::collections::HashMap::new()),
+        let mut state = MetadataCollectionState::<(), ErrorHelper>::new(
+            SupportedMetadataCollections::new(std::collections::HashMap::new()),
         );
         let result = state.set_option(
             &adbc_core::options::OptionStatement::Other("unrelated.option".to_string()),
@@ -506,8 +475,8 @@ mod tests {
 
     #[test]
     fn test_state_capture_wrong_value_type() {
-        let mut state = super::MetadataCollectionState::<(), ErrorHelper>::new(
-            super::SupportedMetadataCollections::new(std::collections::HashMap::new()),
+        let mut state = MetadataCollectionState::<(), ErrorHelper>::new(
+            SupportedMetadataCollections::new(std::collections::HashMap::new()),
         );
         let err = state
             .set_option(
@@ -515,6 +484,92 @@ mod tests {
                 &adbc_core::options::OptionValue::Int(42),
             )
             .unwrap_err();
-        assert!(err.to_adbc().status == adbc_core::error::Status::InvalidArguments);
+        assert_eq!(
+            err.to_adbc().status,
+            adbc_core::error::Status::InvalidArguments
+        );
+    }
+
+    #[test]
+    fn test_filter_schema() {
+        let filters = vec![
+            FilterDescription {
+                name: "filter1".to_string(),
+                filter_type_string: true,
+                filter_type_bytes: false,
+                filter_type_double: false,
+                filter_type_int: false,
+                required: true,
+                remarks: Some("Filter 1".to_string()),
+                is_pattern: false,
+            },
+            FilterDescription {
+                name: "filter2".to_string(),
+                filter_type_string: false,
+                filter_type_bytes: true,
+                filter_type_double: false,
+                filter_type_int: false,
+                required: false,
+                remarks: None,
+                is_pattern: true,
+            },
+            FilterDescription {
+                name: "filter3".to_string(),
+                filter_type_string: true,
+                filter_type_bytes: true,
+                filter_type_double: false,
+                filter_type_int: false,
+                required: false,
+                remarks: None,
+                is_pattern: false,
+            },
+        ];
+
+        let schema = get_filter_schema(&filters);
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "adbc.metadata.filter.filter1");
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert!(!schema.field(0).is_nullable());
+        assert_that!(
+            schema
+                .field(0)
+                .metadata()
+                .get("ADBC:metadata:filter:remarks"),
+            some(eq("Filter 1"))
+        );
+
+        assert_eq!(
+            schema.field(1).name(),
+            "adbc.metadata.filter_pattern.filter2"
+        );
+        assert_eq!(schema.field(1).data_type(), &DataType::Binary);
+        assert!(schema.field(1).is_nullable());
+        assert_that!(
+            schema
+                .field(1)
+                .metadata()
+                .get("ADBC:metadata:filter:remarks"),
+            none()
+        );
+
+        assert_eq!(schema.field(2).name(), "adbc.metadata.filter.filter3");
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Union(
+                arrow_schema::UnionFields::from_fields(vec![
+                    Field::new("field_0", DataType::Utf8, false),
+                    Field::new("field_1", DataType::Binary, false),
+                ]),
+                arrow_schema::UnionMode::Sparse,
+            )
+        );
+        assert!(schema.field(2).is_nullable());
+        assert_that!(
+            schema
+                .field(2)
+                .metadata()
+                .get("ADBC:metadata:filter:remarks"),
+            none()
+        );
     }
 }

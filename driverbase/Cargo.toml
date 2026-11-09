@@ -56,4 +56,5 @@ tracing-subscriber = { version = "0.3", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 
 [dev-dependencies]
+googletest = "0.14"
 tokio = { version = "1", features = ["rt"] }
