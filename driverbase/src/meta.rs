@@ -161,39 +161,12 @@ pub mod schema {
 pub fn get_filter_schema(filters: &[FilterDescription]) -> Schema {
     let mut fields = Vec::new();
     for filter in filters {
-        let mut types = Vec::new();
-        if filter.filter_type_string {
-            types.push(arrow_schema::DataType::Utf8);
-        }
-        if filter.filter_type_bytes {
-            types.push(arrow_schema::DataType::Binary);
-        }
-        if filter.filter_type_double {
-            types.push(arrow_schema::DataType::Float64);
-        }
-        if filter.filter_type_int {
-            types.push(arrow_schema::DataType::Int64);
-        }
-
-        let data_type = match <[_; 1]>::try_from(types) {
-            Ok([ty]) => ty,
-            Err(types) => arrow_schema::DataType::Union(
-                arrow_schema::UnionFields::from_fields(
-                    types
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, t)| arrow_schema::Field::new(format!("field_{i}"), t, false)),
-                ),
-                arrow_schema::UnionMode::Sparse,
-            ),
-        };
-
         let name = format!(
             "adbc.metadata.filter{}.{}",
             if filter.is_pattern { "_pattern" } else { "" },
             filter.name
         );
-        let mut field = arrow_schema::Field::new(name, data_type, !filter.required);
+        let mut field = arrow_schema::Field::new(name, filter.data_type.clone(), !filter.required);
         if let Some(ref remarks) = filter.remarks {
             field.set_metadata(std::collections::HashMap::from([(
                 "ADBC:metadata:filter:remarks".to_string(),
@@ -233,17 +206,27 @@ where
 
 /// The description of a supported filter on a metadata collection. Used to
 /// generate the result of [`MetadataCollectionQuery::filter_schema`].
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FilterDescription {
     pub name: String,
-    // TODO: replace with just an Arrow DataType and add some helpers
-    pub filter_type_string: bool,
-    pub filter_type_bytes: bool,
-    pub filter_type_double: bool,
-    pub filter_type_int: bool,
+    pub data_type: arrow_schema::DataType,
     pub required: bool,
     pub remarks: Option<String>,
     pub is_pattern: bool,
+}
+
+// TODO(lidavidm): add builder API
+
+impl Default for FilterDescription {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            data_type: arrow_schema::DataType::Utf8,
+            required: false,
+            remarks: None,
+            is_pattern: false,
+        }
+    }
 }
 
 /// The metadata for a metadata collection.
@@ -355,30 +338,27 @@ mod tests {
         let filters = vec![
             FilterDescription {
                 name: "filter1".to_string(),
-                filter_type_string: true,
-                filter_type_bytes: false,
-                filter_type_double: false,
-                filter_type_int: false,
+                data_type: DataType::Utf8,
                 required: true,
                 remarks: Some("Filter 1".to_string()),
                 is_pattern: false,
             },
             FilterDescription {
                 name: "filter2".to_string(),
-                filter_type_string: false,
-                filter_type_bytes: true,
-                filter_type_double: false,
-                filter_type_int: false,
+                data_type: DataType::Binary,
                 required: false,
                 remarks: None,
                 is_pattern: true,
             },
             FilterDescription {
                 name: "filter3".to_string(),
-                filter_type_string: true,
-                filter_type_bytes: true,
-                filter_type_double: false,
-                filter_type_int: false,
+                data_type: DataType::Union(
+                    arrow_schema::UnionFields::from_fields(vec![
+                        Field::new("field_0", DataType::Utf8, false),
+                        Field::new("field_1", DataType::Binary, false),
+                    ]),
+                    arrow_schema::UnionMode::Sparse,
+                ),
                 required: false,
                 remarks: None,
                 is_pattern: false,
