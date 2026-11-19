@@ -19,6 +19,8 @@ use std::sync::Arc;
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema;
 
+pub mod filter;
+
 pub type Result<T, E> = std::result::Result<T, crate::error::Error<E>>;
 
 pub type MetadataCollectionMap<Args, E> =
@@ -253,60 +255,6 @@ pub trait MetadataCollection<Args, E>: Send + Sync {
     fn init(&self) -> Box<dyn MetadataCollectionQuery<Args, E> + Send>;
 }
 
-/// A filter helper for a string field of a metadata collection.
-#[derive(Clone, Debug)]
-pub enum Filter {
-    Pattern {
-        pattern: String,
-        compiled: regex_lite::Regex,
-    },
-    Exact(String),
-}
-
-impl PartialEq for Filter {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Filter::Pattern { pattern: p1, .. }, Filter::Pattern { pattern: p2, .. }) => p1 == p2,
-            (Filter::Exact(e1), Filter::Exact(e2)) => e1 == e2,
-            _ => false,
-        }
-    }
-}
-
-impl Filter {
-    pub fn new_pattern(pattern: String) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let mut re = String::with_capacity(pattern.len());
-        re.push('^');
-        for chr in pattern.chars() {
-            match chr {
-                '%' => re.push_str(".*"),
-                '_' => re.push('.'),
-                // See is_meta_character in regex_lite
-                '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^'
-                | '$' | '#' | '&' | '-' | '~' => {
-                    re.push('\\');
-                    re.push(chr);
-                }
-                _ => re.push(chr),
-            }
-        }
-        re.push('$');
-        let compiled = regex_lite::Regex::new(&re)?;
-        Ok(Filter::Pattern { pattern, compiled })
-    }
-
-    pub fn new_exact(exact: String) -> Self {
-        Filter::Exact(exact)
-    }
-
-    pub fn matches(&self, value: &str) -> bool {
-        match self {
-            Filter::Pattern { compiled, .. } => compiled.is_match(value),
-            Filter::Exact(exact) => exact == value,
-        }
-    }
-}
-
 /// The implementation of the "meta" collection.
 struct MetaCollectionQuery<Args, E> {
     supported_collections: SupportedMetadataCollections<Args, E>,
@@ -354,38 +302,6 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
     use googletest::prelude::*;
-
-    #[test]
-    fn test_filter_exact() {
-        let filter = Filter::new_exact("test".to_string());
-        assert!(filter.matches("test"));
-        assert!(!filter.matches("test1"));
-    }
-
-    #[test]
-    fn test_filter_pattern() {
-        let filter = Filter::new_pattern("test%".to_string()).unwrap();
-        assert!(filter.matches("test"));
-        assert!(filter.matches("test1"));
-        assert!(!filter.matches("atest"));
-
-        let filter = Filter::new_pattern("test_".to_string()).unwrap();
-        assert!(!filter.matches("test"));
-        assert!(filter.matches("test1"));
-        assert!(!filter.matches("atest"));
-
-        let filter = Filter::new_pattern("%test%".to_string()).unwrap();
-        assert!(filter.matches("test"));
-        assert!(filter.matches("test1"));
-        assert!(filter.matches("atest"));
-        assert!(!filter.matches("at3st"));
-
-        let filter = Filter::new_pattern("*".to_string()).unwrap();
-        assert!(!filter.matches("test"));
-        assert!(!filter.matches("test1"));
-        assert!(!filter.matches("atest"));
-        assert!(filter.matches("*"));
-    }
 
     #[derive(Clone)]
     struct ErrorHelper;
