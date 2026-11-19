@@ -231,6 +231,14 @@ where
 mod tests {
     use super::*;
 
+    use googletest::prelude::*;
+
+    #[derive(Clone, Copy)]
+    struct ErrorHelper;
+    impl crate::error::ErrorHelper for ErrorHelper {
+        const NAME: &'static str = "test";
+    }
+
     #[test]
     fn test_filter_exact() {
         let filter = Filter::new_exact("test".to_string());
@@ -261,5 +269,12 @@ mod tests {
         assert!(!filter.matches("test1"));
         assert!(!filter.matches("atest"));
         assert!(filter.matches("*"));
+    }
+
+    #[test]
+    fn test_filter_iterator_empty() {
+        let mut iterator = untyped_filter_sets::<ErrorHelper>(None).unwrap();
+        assert_that!(iterator.next(), some(is_ok(is_empty())));
+        assert_that!(iterator.next(), none());
     }
 }
