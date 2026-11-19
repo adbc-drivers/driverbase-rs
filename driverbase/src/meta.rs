@@ -89,51 +89,24 @@ where
         key: &adbc_core::options::OptionStatement,
         value: &adbc_core::options::OptionValue,
     ) -> Result<bool, E> {
-        if let adbc_core::options::OptionStatement::Other(k) = key {
-            if k == "adbc.metadata.collection" {
-                let v = E::option_as_string(key, value)?;
-                if v == "meta" {
-                    self.collection = Some(Box::new(MetaCollectionQuery {
-                        supported_collections: self.supported_collections.clone(),
-                    }));
-                    Ok(true)
-                } else if let Some(collection) = self.supported_collections.collections.get(v) {
-                    self.collection = Some(collection.init());
-                    Ok(true)
-                } else {
-                    Err(E::invalid_argument().format(format_args!(
-                        "unknown collection adbc.metadata.collection={v:?}"
-                    )))
-                }
-            } else if let Some(name) = k.strip_prefix("adbc.metadata.filter_pattern.") {
-                let v = E::option_as_string(key, value)?;
-                if let Some(collection) = &mut self.collection {
-                    let filter = Filter::new_pattern(v.to_string()).map_err(|e| {
-                        E::invalid_argument().format(format_args!(
-                            "invalid regex pattern for filter {k}={v:?}: {e}"
-                        ))
-                    })?;
-                    collection.add_filter(name, filter)?;
-                    Ok(true)
-                } else {
-                    Err(E::invalid_argument()
-                        .format(format_args!("filter {k} specified before collection")))
-                }
-            } else if let Some(name) = k.strip_prefix("adbc.metadata.filter.") {
-                let v = E::option_as_string(key, value)?;
-                if let Some(collection) = &mut self.collection {
-                    collection.add_filter(name, Filter::Exact(v.to_string()))?;
-                    Ok(true)
-                } else {
-                    Err(E::invalid_argument()
-                        .format(format_args!("filter {k} specified before collection")))
-                }
-            } else {
-                Ok(false)
+        if let adbc_core::options::OptionStatement::Other(k) = key
+            && k == "adbc.metadata.collection"
+        {
+            let v = E::option_as_string(key, value)?;
+            if v == "meta" {
+                self.collection = Some(Box::new(MetaCollectionQuery {
+                    supported_collections: self.supported_collections.clone(),
+                }));
+                return Ok(true);
+            } else if let Some(collection) = self.supported_collections.collections.get(v) {
+                self.collection = Some(collection.init());
+                return Ok(true);
             }
-        } else {
-            Ok(false)
+            return Err(E::invalid_argument().format(format_args!(
+                "unknown collection adbc.metadata.collection={v:?}"
+            )));
         }
+        Ok(false)
     }
 }
 
@@ -238,19 +211,30 @@ pub trait MetadataCollectionQuery<Args, E>
 where
     E: crate::error::ErrorHelper,
 {
-    fn add_filter(&mut self, name: &str, filter: Filter) -> Result<(), E>;
+    /// The schema of the collection.
     fn schema(&self) -> Schema;
+    /// The supported filters of the collection (high level API).
     fn supported_filters(&self) -> Vec<FilterDescription> {
         Vec::new()
     }
-    async fn execute(&self, args: Args) -> Result<Box<dyn RecordBatchReader + Send + 'static>, E>;
+    /// The schema of the collection's filters/options.
+    fn filter_schema(&self) -> Schema {
+        get_filter_schema(&self.supported_filters())
+    }
+    /// Evaluate the collection.
+    async fn execute(
+        &self,
+        args: Args,
+        filters: Option<Box<dyn arrow_array::RecordBatchReader + Send>>,
+    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>, E>;
 }
 
 /// The description of a supported filter on a metadata collection. Used to
-/// generate the "meta" collection.
+/// generate the result of [`MetadataCollectionQuery::filter_schema`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FilterDescription {
     pub name: String,
+    // TODO: replace with just an Arrow DataType and add some helpers
     pub filter_type_string: bool,
     pub filter_type_bytes: bool,
     pub filter_type_double: bool,
@@ -269,7 +253,7 @@ pub trait MetadataCollection<Args, E>: Send + Sync {
     fn init(&self) -> Box<dyn MetadataCollectionQuery<Args, E> + Send>;
 }
 
-/// A filter for a string field of a metadata collection.
+/// A filter helper for a string field of a metadata collection.
 #[derive(Clone, Debug)]
 pub enum Filter {
     Pattern {
@@ -332,23 +316,16 @@ struct MetaCollectionQuery<Args, E> {
 impl<Args: Send, E: crate::error::ErrorHelper> MetadataCollectionQuery<Args, E>
     for MetaCollectionQuery<Args, E>
 {
-    fn add_filter(&mut self, name: &str, _value: Filter) -> Result<(), E> {
-        #[allow(
-            clippy::match_single_binding,
-            reason = "placeholder for future filter support"
-        )]
-        match name {
-            _ => Err(E::invalid_argument().format(format_args!(
-                "unsupported filter {name} for metadata collection 'meta'"
-            ))),
-        }
-    }
-
     fn schema(&self) -> Schema {
         schema::META.clone()
     }
 
-    async fn execute(&self, _args: Args) -> Result<Box<dyn RecordBatchReader + Send + 'static>, E> {
+    // TODO: schema may depend on filters, so have a separate bind?
+    async fn execute(
+        &self,
+        _args: Args,
+        _filters: Option<Box<dyn arrow_array::RecordBatchReader + Send>>,
+    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>, E> {
         let mut names = arrow_array::builder::StringBuilder::new();
         let mut remarks = arrow_array::builder::StringBuilder::new();
 
@@ -428,39 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn test_state_no_filters_before_collection() {
-        let mut state = MetadataCollectionState::<(), ErrorHelper>::new(
-            SupportedMetadataCollections::new(std::collections::HashMap::new()),
-        );
-
-        let err = state
-            .set_option(
-                &adbc_core::options::OptionStatement::Other(
-                    "adbc.metadata.filter_pattern.test".to_string(),
-                ),
-                &adbc_core::options::OptionValue::String("test".to_string()),
-            )
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("filter adbc.metadata.filter_pattern.test specified before collection")
-        );
-
-        let err = state
-            .set_option(
-                &adbc_core::options::OptionStatement::Other(
-                    "adbc.metadata.filter.test".to_string(),
-                ),
-                &adbc_core::options::OptionValue::String("test".to_string()),
-            )
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("filter adbc.metadata.filter.test specified before collection")
-        );
-    }
-
-    #[test]
     fn test_state_ignore_unrelated_options() {
         let mut state = MetadataCollectionState::<(), ErrorHelper>::new(
             SupportedMetadataCollections::new(std::collections::HashMap::new()),
@@ -474,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn test_state_capture_wrong_value_type() {
+    fn test_state_set_collection_wrong_value_type() {
         let mut state = MetadataCollectionState::<(), ErrorHelper>::new(
             SupportedMetadataCollections::new(std::collections::HashMap::new()),
         );
