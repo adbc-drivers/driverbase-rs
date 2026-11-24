@@ -19,6 +19,7 @@ use std::sync::Arc;
 pub mod bulk_ingest;
 pub mod error;
 pub mod get_objects;
+pub mod meta;
 pub mod record_reader;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
